@@ -3263,3 +3263,22 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.prof
     tt.return
   }
 }
+
+// -----
+
+// Sparse dot emits mma.sp. The metadata operand is a single packed i32 and the
+// selector is 0, since each thread of a quad supplies the metadata of its own
+// row.
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [16, 8]}>
+#linear = #ttg.linear<{register = [[8, 0]], lane = [[0, 1], [0, 0], [1, 0], [2, 0], [4, 0]], warp = [], block = []}>
+module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_mmav2
+  tt.func @sparse_dot_mmav2(%a: tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>,
+                            %b: tensor<32x8xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>,
+                            %meta: tensor<16x2xi16, #linear>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<16x8xf32, #mma>
+    // CHECK: mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> meta tensor<16x2xi16, #linear> * tensor<32x8xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<16x8xf32, #mma>
+    tt.return
+  }
+}

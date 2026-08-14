@@ -35,6 +35,35 @@ def min_dot_size(target: GPUTarget):
     return check_dot_compatibility
 
 
+def get_min_sparse_dot_size(target: GPUTarget):
+
+    # The returned K is the dense K, i.e. twice the K of the 2:4 sparse lhs.
+    def check_dot_compatibility(lhs_type, rhs_type) -> Tuple[int, int, int]:  # [m, n, k]
+        lhs_bitwidth = lhs_type.scalar.primitive_bitwidth
+        rhs_bitwidth = rhs_type.scalar.primitive_bitwidth
+        assert lhs_bitwidth == rhs_bitwidth, "lhs and rhs bitwidth must be the same"
+        if lhs_bitwidth == 8:
+            # mma.sp.sync.aligned.m16n8k64
+            return (16, 8, 64)
+        # mma.sp.sync.aligned.m16n8k32
+        return (16, 8, 32)
+
+    return check_dot_compatibility
+
+
+def get_supported_sparse_dot_dtypes(target: GPUTarget):
+    capability = target.arch
+    # Sparse dot currently lowers to `mma.sp.sync` (MMAv2), which this backend
+    # only selects on sm_80-sm_89. Hopper and later have their own sparse
+    # instructions (wgmma.sp, tcgen05.mma.sp) that are not implemented yet, and
+    # silently falling back to MMAv2 there would be much slower than the dense
+    # `tl.dot` those targets use, so reject instead.
+    if 80 <= capability < 90:
+        return lambda input_dtype: input_dtype.name in ("fp16", "bf16")
+    else:
+        return lambda input_dtype: False
+
+
 def get_ptxas(arch: int) -> knobs.NvidiaTool:
     return knobs.nvidia.ptxas_blackwell if arch >= 100 else knobs.nvidia.ptxas
 
@@ -259,8 +288,10 @@ class CUDABackend(BaseBackend):
         capability = int(self._parse_arch(options.arch))
         codegen_fns = {
             "convert_custom_types":
-            cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70, "min_dot_size":
-            min_dot_size(self.target)
+            cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70,
+            "min_dot_size": min_dot_size(self.target),
+            "min_sparse_dot_size": get_min_sparse_dot_size(self.target),
+            "supported_sparse_dot_dtypes": get_supported_sparse_dot_dtypes(self.target),
         }
         return codegen_fns
 

@@ -602,3 +602,189 @@ def test_err_histogram_non_32bit_int(ptr_ty):
             triton.compiler.ASTSource(fn=kernel, signature={"x_ptr": ptr_ty, "z_ptr": "*i32", "N": "constexpr"},
                                       constexprs={"N": 4}))
     assert "histogram only supports 32-bit integer input" in str(e.value.__cause__)
+
+
+# ---- dot_sparse compile-error tests ----
+
+
+def test_dot_sparse_k_dim_mismatch(fresh_triton_cache):
+    """A's K/2 * 2 must equal B's K."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        N: tl.constexpr = 32
+        a = tl.full((M, 16), 0.0, tl.float16)    # K/2 = 16 → K = 32
+        b = tl.full((64, N), 0.0, tl.float16)     # B's K = 64 ≠ 32
+        meta = tl.full((M, 2), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="not compatible for matmul"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_unsupported_dtype(fresh_triton_cache):
+    """Unsupported dtype should fail."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float32)
+        b = tl.full((K, N), 0.0, tl.float32)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Unsupported lhs dtype"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_rank_mismatch(fresh_triton_cache):
+    """input and other must have equal ranks."""
+
+    @triton.jit
+    def kernel():
+        a = tl.full((2, 32, 16), 0.0, tl.float16)   # 3D
+        b = tl.full((32, 32), 0.0, tl.float16)       # 2D
+        meta = tl.full((2, 32, 2), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Both inputs must be 2D or 3D"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_dtype_mismatch(fresh_triton_cache):
+    """lhs and rhs must have the same dtype."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.bfloat16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Both operands must be same dtype"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_unsupported_rhs_dtype(fresh_triton_cache):
+    """Unsupported rhs dtype should fail even if lhs is valid."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float32)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Unsupported rhs dtype"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_min_size(fresh_triton_cache):
+    """Dimensions below minimum (M>=16, N>=16, K>=16) should fail."""
+
+    @triton.jit
+    def kernel():
+        # M=8 < 16
+        a = tl.full((8, 16), 0.0, tl.float16)    # M=8, K/2=16
+        b = tl.full((32, 16), 0.0, tl.float16)    # K=32, N=16
+        meta = tl.full((8, 2), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Input shapes should have"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_acc_type_mismatch(fresh_triton_cache):
+    """acc must match the return type (fp32, same M/N shape)."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        # acc shape (M, N) is correct but dtype fp16 != expected fp32
+        acc = tl.full((M, N), 0.0, tl.float16)
+        tl.dot_sparse(a, b, meta, acc=acc)
+
+    with pytest.raises(CompilationError):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_meta_wrong_dtype(fresh_triton_cache):
+    """Metadata must be i16."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 16), 0, tl.int32)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Metadata must be int16"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_meta_wrong_k(fresh_triton_cache):
+    """Metadata K must be A's K divided by 8 (dense K divided by 16)."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 8), 0, tl.int16)  # twice as many columns as needed
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Metadata must be a tensor of shape"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_meta_wrong_m(fresh_triton_cache):
+    """Metadata M must match A's M."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M // 2, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Metadata must be a tensor of shape"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_meta_wrong_rank(fresh_triton_cache):
+    """Metadata rank must match A's rank."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((1, M, K // 2), 0.0, tl.float16)
+        b = tl.full((1, K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    with pytest.raises(CompilationError, match="Metadata must have the same rank"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))

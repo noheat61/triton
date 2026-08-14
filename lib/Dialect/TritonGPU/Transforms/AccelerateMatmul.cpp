@@ -98,7 +98,7 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
   auto slices = mlir::getSlice(dotOp, {filter}, {filter});
   bool hasChainedDot = false;
   for (Operation *op : slices) {
-    if (isa<DotOp, DotScaledOp>(op) && (op != dotOp)) {
+    if (isa<DotOp, DotScaledOp, DotSparseOp>(op) && (op != dotOp)) {
       auto resTy = cast<RankedTensorType>(op->getResult(0).getType());
       if (resTy.getRank() != rank) {
         continue;
@@ -575,6 +575,100 @@ public:
     return success();
   }
 };
+
+class SparseBlockedToMMA : public mlir::OpRewritePattern<DotSparseOp> {
+  int computeCapability;
+
+public:
+  SparseBlockedToMMA(mlir::MLIRContext *context, int computeCapability,
+                     int benefit)
+      : OpRewritePattern<DotSparseOp>(context, benefit),
+        computeCapability(computeCapability) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::DotSparseOp dotOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    // Sparse MMA only exists as MMAv2 (mma.sp.sync) here, which is selected on
+    // sm_80-sm_89. Hopper and later have wgmma.sp / tcgen05.mma.sp instead;
+    // until those are implemented, leave the op alone rather than falling back
+    // to MMAv2, which would be slower there than the dense path.
+    if (computeCapability < 80 || computeCapability >= 90)
+      return failure();
+
+    auto retType = cast<RankedTensorType>(dotOp.getType());
+    if (!retType.getEncoding() ||
+        mlir::isa<NvidiaMmaEncodingAttr>(retType.getEncoding()))
+      return failure();
+
+    int versionMajor = 2;
+    auto mmaResult = createMMAEncodingForDot(dotOp, rewriter,
+                                             computeCapability, versionMajor);
+    if (!mmaResult.mmaEnc)
+      return failure();
+
+    Value a = dotOp.getA();
+    Value b = dotOp.getB();
+    Value aMeta = dotOp.getAMeta();
+
+    // For sparse ops, use element type bitwidth directly.
+    // computeOrigBitWidth halves bitwidth when JoinOp is in the backward
+    // slice (to compensate for fp8-pair-packed-as-fp16 loads). But for
+    // dot_sparse, users may use tl.join purely for interleaving sparse
+    // values (e.g., in fused sparsify_24 + dot_sparse kernels), where
+    // the halving is incorrect and produces wrong kWidth in the encoding.
+    auto aEltBits =
+        cast<RankedTensorType>(a.getType()).getElementTypeBitWidth();
+    auto bEltBits =
+        cast<RankedTensorType>(b.getType()).getElementTypeBitWidth();
+    int minBitwidth = std::min<int>(aEltBits, bEltBits);
+    a = convertDotOperandForMMA(a, 0, minBitwidth, mmaResult.newRetType,
+                                rewriter);
+    b = convertDotOperandForMMA(b, 1, minBitwidth, mmaResult.newRetType,
+                                rewriter);
+    // Convert aMeta to the mma.sp metadata layout. It duplicates across the
+    // parent MMA's N-warps, which LinearEncodingAttr expresses as broadcast
+    // bases, so no dedicated encoding attribute is needed.
+    {
+      auto metaTy = cast<RankedTensorType>(aMeta.getType());
+      MLIRContext *ctx = rewriter.getContext();
+      auto ll = triton::gpu::getSparseMetadataLayout(
+          ctx, metaTy.getShape(), mmaResult.mmaEnc.getWarpsPerCTA(),
+          mmaResult.mmaEnc.getCGALayout());
+      auto metaEncoding =
+          triton::gpu::LinearEncodingAttr::get(ctx, std::move(ll));
+      auto newMetaTy = metaTy.cloneWithEncoding(metaEncoding);
+      aMeta = ConvertLayoutOp::create(rewriter, aMeta.getLoc(), newMetaTy,
+                                      aMeta);
+    }
+
+    auto newDot = DotSparseOp::create(
+        rewriter, dotOp.getLoc(), mmaResult.newRetType,
+        a, b, mmaResult.newAcc, aMeta);
+    rewriter.replaceOpWithNewOp<ConvertLayoutOp>(dotOp, dotOp.getType(),
+                                                 newDot->getResult(0));
+    return success();
+  }
+};
+
+static bool canUseTwoCTAs(triton::DotOp dotOp) {
+  RankedTensorType retType = dotOp.getType();
+  auto retShapePerCTA = getShapePerCTA(retType);
+  // TODO: we could support 2 CTAs matmul with numCTAs > 2.
+  SmallVector<unsigned> splitNum = getCTASplitNum(retType.getEncoding());
+  if (splitNum.size() != 2 || splitNum[0] != 2 || splitNum[1] != 1)
+    return false;
+  int m = retShapePerCTA[0];
+  int n = retShapePerCTA[1];
+  // minimum size supported by 2CTAs mmav5.
+  if (m < 64 || n < 32)
+    return false;
+  Value b = dotOp.getB();
+  // Skip convert layouts.
+  while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
+    b = cvtOp.getSrc();
+  return llvm::isa_and_nonnull<triton::LoadOp, triton::DescriptorLoadOp,
+                               triton::DescriptorGatherOp>(b.getDefiningOp());
+}
 
 static DistributedEncodingTrait
 replaceCGALayout(DistributedEncodingTrait layout,
@@ -1100,6 +1194,7 @@ public:
     constexpr int benefitSM120 = 10;
 
     patterns.add<BlockedToMMA>(context, computeCapability, benefitDefault);
+    patterns.add<SparseBlockedToMMA>(context, computeCapability, benefitDefault);
     patterns.add<ScaledBlockedToMMA>(context, computeCapability, benefitSM120);
     populateDecomposeScaledBlockedPatterns(patterns, benefitDefault);
     patterns.add<BlockedToMMAv5, ScaledBlockedToMMAv5>(

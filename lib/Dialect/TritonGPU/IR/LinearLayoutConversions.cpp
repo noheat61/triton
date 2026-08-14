@@ -1029,6 +1029,85 @@ DotOperandEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
 }
 
+LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
+                                     ArrayRef<unsigned> warpsPerCTA,
+                                     CGAEncodingAttr cgaLayout) {
+  // Metadata thread mapping for mma.sp m16n8k32 fp16/bf16 (selector=0):
+  //   Thread T: E[15:0]  = meta[row=T>>2][col=T%4]
+  //             E[31:16] = meta[row=(T>>2)+8][col=T%4]
+  //
+  // The resulting bases are:
+  //   register:
+  //     (8, 0)            -- row+8 for second element
+  //     (0, 2), (0, 4)... -- K-group strides per repKA (metaK beyond 2 cols)
+  //     (16*wm, 0)...     -- M-rep strides when metaM > 16*warpsM
+  //   lane (5 bits, 32):
+  //     (0, 1), (0, 0)    -- col = T%4; bit 1 is a broadcast basis
+  //     (1, 0), (2, 0), (4, 0) -- row = T>>2
+  //   warp:
+  //     (0, 0)...         -- N-warp: metadata duplicated (broadcast basis)
+  //     (16, 0)...        -- M-warp: each warp covers next 16 rows
+  //
+  // Every basis moves along at most one output dim, and dropping the
+  // broadcast bases leaves a bijection onto metaM x metaK, so this satisfies
+  // LinearEncodingAttr and needs no dedicated encoding attribute.
+  auto S = [ctx](const char *s) { return StringAttr::get(ctx, s); };
+
+  assert(shape.size() == 2 && "sparse metadata expects a rank-2 tensor");
+  assert(warpsPerCTA.size() == 2 && "warp layout must match metadata rank");
+  int64_t metaM = shape[0];
+  int64_t metaK = shape[1];
+
+  // Register bases: start with row+8 for the second element per thread.
+  std::vector<std::vector<int32_t>> regBases = {{8, 0}};
+
+  // Lane bases for m16n8k32 metadata.
+  //   bit 0 (T%2 lsb)    -> (0, 1) col bit 0
+  //   bit 1 (T%4 msb)    -> (0, 0) duplicate (HW uses this as selector input)
+  //   bits 2..4 (T>>2)   -> (1, 0), (2, 0), (4, 0) row
+  std::vector<std::vector<int32_t>> laneBases = {
+      {0, 1}, {0, 0}, {1, 0}, {2, 0}, {4, 0},
+  };
+
+  // K-group register extension: each MMA uses 2 K-cols. The 2-col offset
+  // lives in a register bit (never lane) so HW's selector-switching works
+  // correctly across k_reps (selector=0 for even k_rep, =1 for odd k_rep).
+  for (int64_t c = 2; c < metaK; c *= 2) {
+    regBases.push_back({0, (int32_t)c});
+  }
+
+  // Warp basis order must match NvidiaMmaEncodingAttr which uses
+  // warpOrder = getMatrixOrder(rank=2, rowMajor=true) = {1, 0}. That means
+  // warp bit 0 points along dim 1 (N) and warp bit 1 points along dim 0 (M).
+  // For A-operand metadata, N-warps duplicate (broadcast basis); M-warps
+  // offset by 16 rows each.
+  std::vector<std::vector<int32_t>> warpBases;
+  for (unsigned w = 1; w < warpsPerCTA[1]; w *= 2) {
+    warpBases.push_back({0, 0});
+  }
+  int64_t warpRowsCovered = 16;
+  for (unsigned w = 1; w < warpsPerCTA[0]; w *= 2) {
+    warpBases.push_back({(int32_t)warpRowsCovered, 0});
+    warpRowsCovered *= 2;
+  }
+
+  // M-rep register extension for metaM beyond warp coverage.
+  int64_t mRepStride = 16 * warpsPerCTA[0];
+  for (int64_t r = mRepStride; r < metaM; r *= 2) {
+    regBases.push_back({(int32_t)r, 0});
+  }
+
+  LinearLayout ctaLayout(
+      {
+          {S("register"), regBases},
+          {S("lane"), laneBases},
+          {S("warp"), warpBases},
+      },
+      {S("dim0"), S("dim1")});
+
+  return combineCtaCgaWithShape(ctaLayout, cgaLayout, shape);
+}
+
 LinearLayout SliceEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   MLIRContext *ctx = getContext();
 

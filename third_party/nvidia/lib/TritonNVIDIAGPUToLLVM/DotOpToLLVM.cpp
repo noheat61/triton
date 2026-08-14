@@ -26,6 +26,11 @@ LogicalResult convertMMADotScaled(triton::DotScaledOp op,
                                   const LLVMTypeConverter *typeConverter,
                                   ConversionPatternRewriter &rewriter);
 
+LogicalResult convertMMASparseDot(triton::DotSparseOp op,
+                                  triton::DotSparseOp::Adaptor adaptor,
+                                  const LLVMTypeConverter *typeConverter,
+                                  ConversionPatternRewriter &rewriter);
+
 LogicalResult convertWGMMA(triton::nvidia_gpu::WarpGroupDotOp op,
                            triton::nvidia_gpu::WarpGroupDotOp::Adaptor adaptor,
                            const LLVMTypeConverter *typeConverter,
@@ -50,6 +55,21 @@ struct ScaledDotOpConversion
           op, "ScaledDotOp result encoding must have a permutation-matrix "
               "linear layout");
     return convertMMADotScaled(op, adaptor, getTypeConverter(), rewriter);
+  }
+};
+
+struct SparseDotOpConversion
+    : public ConvertOpToLLVMPattern<triton::DotSparseOp> {
+  using ConvertOpToLLVMPattern<triton::DotSparseOp>::ConvertOpToLLVMPattern;
+
+  SparseDotOpConversion(LLVMTypeConverter &converter, int,
+                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::DotSparseOp>(converter, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(triton::DotSparseOp op, triton::DotSparseOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return convertMMASparseDot(op, adaptor, getTypeConverter(), rewriter);
   }
 };
 
@@ -223,6 +243,7 @@ void mlir::triton::NVIDIA::populateDotOpToLLVMPatterns(
     int computeCapability, PatternBenefit benefit) {
   patterns.add<DotOpConversion>(typeConverter, computeCapability, benefit);
   patterns.add<DotI8OpConversion>(typeConverter, computeCapability, benefit);
+  patterns.add<SparseDotOpConversion>(typeConverter, computeCapability, benefit);
   patterns.add<WarpGroupDotOpConversion>(typeConverter, benefit);
   patterns.add<WarpGroupDotWaitOpConversion>(typeConverter, benefit);
   patterns.add<ScaledDotOpConversion>(typeConverter, computeCapability,

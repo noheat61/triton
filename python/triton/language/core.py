@@ -2338,6 +2338,38 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
                                 rhs_k_pack, out_dtype)
 
 
+@builtin
+def dot_sparse(input, other, input_meta, acc=None, _semantic=None):
+    """
+    Returns the matrix product of two blocks and a third metadata block, where the first block is 2:4 structurally sparse and the second block is dense.
+    The third metadata block describes which 2 out of 4 consecutive elements in the first input are zero.
+    dot_sparse is currently experimental, and this interface is subject to change.
+
+    The three blocks must be two-dimensional or three-dimensional and have compatible inner dimensions.
+    For three-dimensional blocks, `tl.dot_sparse` performs the batched matrix product,
+    where the first dimension of each block represents the batch dimension.
+
+    `input_meta` is the metadata describing which two of every four consecutive
+    elements of `input` are kept. It is an int16 tensor whose last dimension is
+    the dense K divided by 16, i.e. `input`'s last dimension divided by 8: each
+    int16 packs four 4-bit groups, and each group holds the two 2-bit indices of
+    the kept elements of one group of four dense elements. This layout is the
+    same on every backend; rearranging it for the target instruction is the
+    compiler's job.
+
+    :param input: The first tensor to be multiplied, holding only the kept
+        elements, so its last dimension is half of the dense K.
+    :type input: 2D or 3D tensor of scalar-type in {:code:`float16`, :code:`bfloat16`}
+    :param other: The second tensor to be multiplied.
+    :type other: 2D or 3D tensor of scalar-type in {:code:`float16`, :code:`bfloat16`}
+    :param input_meta: The 2:4 metadata for `input`.
+    :type input_meta: 2D or 3D tensor of scalar-type :code:`int16`
+    :param acc: The accumulator tensor. If not None, the result is added to this tensor.
+    :type acc: 2D or 3D tensor of scalar-type in {:code:`float32`}
+    """
+    return _semantic.dot_sparse(input, other, input_meta, acc)
+
+
 # -----------------------
 # Non-Atomic Memory Operations
 # -----------------------

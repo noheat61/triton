@@ -2927,6 +2927,7 @@ SmallVector<unsigned> DotOperandEncodingAttr::getRepOrder() const {
 CGAEncodingAttr DotOperandEncodingAttr::getCGALayout() const {
   return inferDotOperandCGALayout(::getCGALayout(getParent()), getOpIdx());
 }
+
 LogicalResult DotOperandEncodingAttr::verify(
     function_ref<::mlir::InFlightDiagnostic()> emitError, unsigned opIdx,
     Attribute parent, unsigned kWidth) {

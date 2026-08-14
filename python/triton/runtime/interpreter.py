@@ -409,6 +409,8 @@ class InterpreterBuilder:
         self.codegen_fns = {}
         self.codegen_fns["convert_custom_types"] = ExtraFunctions._convert_custom_types
         self.codegen_fns["min_dot_size"] = lambda lhsType, rhsType: (1, 1, 1)
+        self.codegen_fns["min_sparse_dot_size"] = lambda lhsType, rhsType: (1, 1, 4)
+        self.codegen_fns["supported_sparse_dot_dtypes"] = lambda input_dtype: input_dtype.name in ("fp16", "bf16")
 
     def set_grid_idx(self, x, y, z):
         if not x < self.grid_dim[0]:
@@ -764,6 +766,26 @@ class InterpreterBuilder:
             a_data = _convert_float(a_data, a.dtype, tl.float16, None).view(np.float16)
             b_data = _convert_float(b_data, b.dtype, tl.float16, None).view(np.float16)
         return TensorHandle(np.matmul(a_data, b_data, dtype=d.data.dtype) + d.data, d.dtype.scalar)
+
+    def create_dot_sparse(self, a, b, d, a_meta):
+        # Rebuild the dense lhs from the kept elements and the metadata, then
+        # reuse the dense matmul. `a` holds the two kept elements of every group
+        # of four, and each int16 of `a_meta` packs four 4-bit groups, each
+        # holding the two 2-bit indices of one group's kept elements.
+        a_data = a.data
+        meta = a_meta.data.astype(np.uint16)
+        k_sparse = a_data.shape[-1]
+        dense_shape = a_data.shape[:-1] + (k_sparse * 2, )
+        # Which group of four dense elements each kept element belongs to, and
+        # which int16 and nibble of the metadata describes that group.
+        group = np.arange(k_sparse) // 2
+        nibble = (meta[..., group // 4] >> (4 * (group % 4)).astype(np.uint16)) & 0xF
+        # Each nibble holds the two 2-bit indices of its group's kept elements.
+        idx_in_group = (nibble >> (2 * (np.arange(k_sparse) % 2)).astype(np.uint16)) & 0x3
+        dense_col = (group * 4 + idx_in_group).astype(np.intp)
+        dense = np.zeros(dense_shape, dtype=a_data.dtype)
+        np.put_along_axis(dense, dense_col, a_data, axis=-1)
+        return self.create_dot(TensorHandle(dense, a.dtype.scalar), b, d, None, 0)
 
     def create_make_range(self, ret_ty, start, stop):
         return TensorHandle(np.arange(start, stop, dtype=np.int32), tl.int32)

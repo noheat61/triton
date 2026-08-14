@@ -1546,6 +1546,60 @@ class TritonSemantic(Generic[TensorTy]):
         return self.tensor(
             self.builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc), ret_ty)
 
+    def dot_sparse(self, lhs: TensorTy, rhs: TensorTy, lhs_meta: TensorTy, acc: TensorTy) -> TensorTy:
+        assert lhs.type.is_block() and rhs.type.is_block()
+
+        supported_sparse_dot_dtypes = self.builder.codegen_fns.get("supported_sparse_dot_dtypes")
+        assert supported_sparse_dot_dtypes is not None, "Sparse dot is unsupported on this platform"
+        # A target reports no supported dtypes at all when it cannot do sparse
+        # dot, so this also covers "this architecture is unsupported".
+        assert supported_sparse_dot_dtypes(lhs.dtype), \
+            f"Unsupported lhs dtype {lhs.dtype} for dot_sparse on this target"
+        assert supported_sparse_dot_dtypes(rhs.dtype), \
+            f"Unsupported rhs dtype {rhs.dtype} for dot_sparse on this target"
+        assert lhs.dtype == rhs.dtype, f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
+
+        lhs_rank = len(lhs.shape)
+        rhs_rank = len(rhs.shape)
+        meta_rank = len(lhs_meta.shape)
+        assert (lhs_rank == rhs_rank == 2) or (
+            lhs_rank == rhs_rank == 3), f"Both inputs must be 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
+        assert meta_rank == lhs_rank, \
+            f"Metadata must have the same rank as the first input; (meta: {lhs_meta.shape} vs lhs: {lhs.shape})"
+        assert lhs_meta.dtype == tl.int16, f"Metadata must be int16. Got {lhs_meta.dtype}"
+        # Each int16 packs four 4-bit groups, one per group of four dense
+        # elements, so it describes 16 dense elements, i.e. 8 elements of lhs.
+        meta_shape = [lhs.shape[i].value for i in range(lhs_rank - 1)] + [lhs.shape[-1].value // 8]
+        assert lhs.shape[-1].value % 8 == 0, \
+            f"First input's K dimension must be a multiple of 8. Got {lhs.shape[-1].value}"
+        assert [d.value for d in lhs_meta.shape] == meta_shape, \
+            f"Metadata must be a tensor of shape {meta_shape}. Got {[d.value for d in lhs_meta.shape]}"
+        assert lhs.shape[-1].value * 2 == rhs.shape[
+            -2].value, f"First input shape {lhs.shape} and second input shape {rhs.shape} are not compatible for matmul (lhs: {lhs.shape} vs rhs: {rhs.shape})"
+        assert self.builder.codegen_fns.get(
+            "min_sparse_dot_size") is not None, "target doesn't provide lower shape bounds for sparse dot."
+        min_dot_size = self.builder.codegen_fns["min_sparse_dot_size"](lhs.type, rhs.type)
+        # lhs.shape[-1].value (K-Dim) is 2:4 sparse
+        assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value * 2 >= min_dot_size[2] \
+            and rhs.shape[-1].value >= min_dot_size[1], \
+                f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
+
+        _0 = self.builder.get_fp32(0)
+        ret_scalar_ty = tl.float32
+
+        M = lhs.type.shape[-2]
+        N = rhs.type.shape[-1]
+        B = lhs.type.shape[0] if lhs_rank == 3 else None
+        ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])
+
+        if acc is None:
+            acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
+        else:
+            acc_handle = acc.handle
+            assert acc.type == ret_ty
+
+        return self.tensor(self.builder.create_dot_sparse(lhs.handle, rhs.handle, acc_handle, lhs_meta.handle), ret_ty)
+
     def _str_to_fp_type(self, float_format: str):
         ty_enum = getattr(ir.ScaleDotElemTypeTY, float_format.upper(), None)
         if ty_enum is None:

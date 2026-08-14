@@ -7561,3 +7561,113 @@ def test_libdevice_rint(dtype_str, device):
     rint_kernel[(triton.cdiv(numel, BLOCK_SIZE), )](res_out, x_tri, numel, BLOCK_SIZE)
     ref_out = np.rint(x_np)
     np.testing.assert_allclose(to_numpy(res_out), ref_out, rtol=0, atol=0, equal_nan=True)
+
+
+# ---- tl.dot_sparse (2:4 structured sparsity) ----
+
+
+@pytest.mark.skipif(not is_cuda(), reason="NVIDIA backend only")
+def test_dot_sparse_valid_ttir(fresh_triton_cache):
+    """Valid dot_sparse generates tt.dot_sparse in TTIR."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    # Should compile to TTIR without errors (will fail at lowering, but TTIR gen is fine)
+    src = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    target = triton.runtime.driver.active.get_current_target()
+    backend = triton.compiler.make_backend(target)
+    options = backend.parse_options({})
+    context = triton._C.libtriton.ir.context()
+    backend.load_dialects(context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
+                         backend.get_module_map(), context)
+    ir_str = str(module)
+    assert "tt.dot_sparse" in ir_str
+
+
+@pytest.mark.skipif(not is_cuda(), reason="NVIDIA backend only")
+def test_dot_sparse_valid_ttir_bf16(fresh_triton_cache):
+    """Valid dot_sparse with bf16 generates tt.dot_sparse in TTIR."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.bfloat16)
+        b = tl.full((K, N), 0.0, tl.bfloat16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    src = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    target = triton.runtime.driver.active.get_current_target()
+    backend = triton.compiler.make_backend(target)
+    options = backend.parse_options({})
+    context = triton._C.libtriton.ir.context()
+    backend.load_dialects(context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
+                         backend.get_module_map(), context)
+    ir_str = str(module)
+    assert "tt.dot_sparse" in ir_str
+
+
+@pytest.mark.skipif(not is_cuda(), reason="NVIDIA backend only")
+def test_dot_sparse_valid_ttir_with_acc(fresh_triton_cache):
+    """Valid dot_sparse with explicit acc generates tt.dot_sparse in TTIR."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        acc = tl.full((M, N), 0.0, tl.float32)
+        tl.dot_sparse(a, b, meta, acc=acc)
+
+    src = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    target = triton.runtime.driver.active.get_current_target()
+    backend = triton.compiler.make_backend(target)
+    options = backend.parse_options({})
+    context = triton._C.libtriton.ir.context()
+    backend.load_dialects(context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
+                         backend.get_module_map(), context)
+    ir_str = str(module)
+    assert "tt.dot_sparse" in ir_str
+
+
+@pytest.mark.skipif(not is_cuda(), reason="NVIDIA backend only")
+def test_dot_sparse_valid_ttir_3d(fresh_triton_cache):
+    """Valid 3D batched dot_sparse generates tt.dot_sparse in TTIR."""
+
+    @triton.jit
+    def kernel():
+        B: tl.constexpr = 2
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((B, M, K // 2), 0.0, tl.float16)
+        b = tl.full((B, K, N), 0.0, tl.float16)
+        meta = tl.full((B, M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta)
+
+    src = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    target = triton.runtime.driver.active.get_current_target()
+    backend = triton.compiler.make_backend(target)
+    options = backend.parse_options({})
+    context = triton._C.libtriton.ir.context()
+    backend.load_dialects(context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
+                         backend.get_module_map(), context)
+    ir_str = str(module)
+    assert "tt.dot_sparse" in ir_str

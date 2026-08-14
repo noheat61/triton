@@ -962,3 +962,239 @@ LogicalResult convertMMADotScaled(triton::DotScaledOp op,
                         typeConverter, rewriter, mmaType, numRegisters,
                         mmaInstrPtxScaled.at(mmaType), emit);
 }
+
+// ---- Sparse MMA (mma.sp) lowering ----
+
+inline static const std::map<TensorCoreType, std::string> mmaInstrPtxSparse = {
+    {TensorCoreType::FP32_FP16_FP16_FP32,
+     "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32"},
+    {TensorCoreType::FP32_BF16_BF16_FP32,
+     "mma.sp.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32"},
+};
+
+static TensorCoreType getMmaTypeSparseDot(RankedTensorType aTy,
+                                          RankedTensorType bTy,
+                                          RankedTensorType dTy) {
+  if (dTy.getElementType().isF32()) {
+    if (aTy.getElementType().isF16() && bTy.getElementType().isF16())
+      return TensorCoreType::FP32_FP16_FP16_FP32;
+    if (aTy.getElementType().isBF16() && bTy.getElementType().isBF16())
+      return TensorCoreType::FP32_BF16_BF16_FP32;
+  }
+  return TensorCoreType::NOT_APPLICABLE;
+}
+
+// Emit one mma.sp.sync PTX instruction.
+// A: 4 regs (same as dense m16n8k16), B: 4 regs (2x dense), metadata: 1 i32.
+static void callMmaSparse(PTXBuilder &builder, int b, const BaseOffset &baseA,
+                           int bKBase,
+                           mlir::triton::PTXInstr &mma, unsigned numMmaRets,
+                           unsigned colsPerThread, int numCPackedElem,
+                           unsigned batchOffset, ValueTableV2 &ha,
+                           ValueTableV2 &hb, const SmallVector<Value> &fc,
+                           Value metadataReg) {
+  auto retArgs = builder.newListOperand(numMmaRets, "=f");
+  auto cArgs = builder.newListOperand();
+  for (unsigned i = 0; i < numMmaRets; ++i) {
+    cArgs->listAppend(builder.newOperand(
+        fc[(baseA.m * colsPerThread + 4 * baseA.n) / numCPackedElem + i +
+           batchOffset * b],
+        std::to_string(i)));
+  }
+
+  // A: 4 registers — 2 k-regs x 2 m-tile positions
+  auto aArgs = builder.newListOperand();
+  for (int vk = 0; vk < 2; ++vk) {
+    aArgs->listAppend(
+        builder.newOperand(ha[{b, baseA.m, baseA.k + vk}], "r"));
+    aArgs->listAppend(
+        builder.newOperand(ha[{b, baseA.m + 1, baseA.k + vk}], "r"));
+  }
+
+  // B: 4 registers — 2 B k-groups x 2 k-regs each (covering K=32)
+  auto bArgs = builder.newListOperand();
+  for (int vk = 0; vk < 4; ++vk) {
+    bArgs->listAppend(
+        builder.newOperand(hb[{b, baseA.n, bKBase + vk}], "r"));
+  }
+
+  auto metaArg = builder.newOperand(metadataReg, "r");
+  // The selector picks which thread of each quad supplies the metadata for the
+  // whole quad. getSparseMetadataLayout() gives every thread the metadata of
+  // its own rows, so thread 0 of the quad already holds what the quad needs and
+  // the selector is always 0.
+  auto selectorArg = builder.newConstantOperand("0x0");
+
+  SmallVector<PTXBuilder::Operand *> ops{retArgs, aArgs, bArgs, cArgs,
+                                         metaArg, selectorArg};
+  mma(ops);
+}
+
+LogicalResult convertMMASparseDot(triton::DotSparseOp op,
+                                  triton::DotSparseOp::Adaptor adaptor,
+                                  const LLVMTypeConverter *typeConverter,
+                                  ConversionPatternRewriter &rewriter) {
+  auto loc = op.getLoc();
+  auto aTensorTy = cast<RankedTensorType>(op.getA().getType());
+  auto bTensorTy = cast<RankedTensorType>(op.getB().getType());
+  auto dTensorTy = cast<RankedTensorType>(op.getD().getType());
+
+  TensorCoreType mmaType =
+      getMmaTypeSparseDot(aTensorTy, bTensorTy, dTensorTy);
+  if (mmaType == TensorCoreType::NOT_APPLICABLE)
+    return emitError(loc, "Unsupported data types for sparse MMA");
+  if (mmaInstrPtxSparse.find(mmaType) == mmaInstrPtxSparse.end())
+    return emitError(loc, "No PTX instruction for this sparse MMA type");
+
+  NumRegisters numRegisters = {2, 1, 2}; // same as dense fp16 MMAv2
+
+  int bitwidth = aTensorTy.getElementType().getIntOrFloatBitWidth();
+  auto aShapePerCTA = triton::gpu::getShapePerCTA(aTensorTy);
+  auto bShapePerCTA = triton::gpu::getShapePerCTA(bTensorTy);
+  auto dShapePerCTA = triton::gpu::getShapePerCTA(dTensorTy);
+
+  auto dotOpA = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
+  int kWidth = dotOpA.getKWidth();
+  auto repA =
+      cast<NvidiaMmaEncodingAttr>(dotOpA.getParent())
+          .getRepForOperand(aShapePerCTA, bitwidth, kWidth, dotOpA.getOpIdx());
+
+  auto dotOpB = cast<DotOperandEncodingAttr>(bTensorTy.getEncoding());
+  auto repB =
+      cast<NvidiaMmaEncodingAttr>(dotOpB.getParent())
+          .getRepForOperand(bShapePerCTA, bitwidth, kWidth, dotOpB.getOpIdx());
+
+  int repKA = repA[2];   // K/2 / tileK
+  int repKB = repB[1];   // K / tileK = 2 * repKA
+  int repM = repA[1];
+  int repN = repB[2];
+  int repBatch = repA[0];
+
+  // Extract A values (indexed by compressed K)
+  auto ha = getValuesFromDotOperandLayoutStruct(
+      typeConverter, loc, rewriter, adaptor.getA(), repBatch, repM, repKA,
+      aTensorTy, numRegisters);
+
+  // Extract B values (indexed by full K)
+  auto hb = getValuesFromDotOperandLayoutStruct(
+      typeConverter, loc, rewriter, adaptor.getB(), repBatch, repN, repKB,
+      bTensorTy, numRegisters);
+
+  // Load C
+  auto fc = loadC(op.getC(), adaptor.getC(), loc, rewriter);
+
+  // Extract metadata values from LinearEncoding-annotated metadata tensor.
+  // The custom LinearEncoding in AccelerateMatmul places elements per thread
+  // in this order (from our basis vector construction):
+  //   register 0: (row+8, col)   → 2nd element of current MMA
+  //   register 1: +extra K-group → adjacent K-col (for repKA > 1)
+  //   register 2+: more K-groups or M-tiles
+  //
+  // For each MMA at (m_rep, k_rep), thread T gets:
+  //   E[15:0]  = meta[T>>2 + m_rep*16*warpsM][T%4 + k_rep*...] (low reg)
+  //   E[31:16] = meta[T>>2 + m_rep*16*warpsM + 8][T%4 + k_rep*...] (high reg)
+  //
+  // Per-thread element array ordering:
+  //   idx = (k_extra * 2 + reg0) where reg0 ∈ {0, 1} for (row, row+8)
+  //
+  // With our register basis [{8,0}, {0,4}, {0,8}, ...], the linear index
+  // order for elements within a thread is:
+  //   idx = reg_bit0 * 1 + reg_bit1 * 2 + ...
+  //   = (row_offset_selector) + (k_group_offset_selector) << 1
+  //
+  // For one MMA k_rep: take idx 2*k_rep and 2*k_rep+1
+  auto metaElems = unpackTensorElements(loc, adaptor.getAMeta(), rewriter,
+                                        op.getAMeta().getType());
+
+  auto tb = TritonLLVMOpBuilder(loc, rewriter);
+  MLIRContext *ctx = op->getContext();
+
+  int bitwidthRet = dTensorTy.getElementType().getIntOrFloatBitWidth();
+  auto numMmaRets = static_cast<unsigned>(bitwidthRet / 8); // 4 for f32
+  int numCPackedElem = 4 / static_cast<int>(numMmaRets);    // 1 for f32
+
+  auto rank = dTensorTy.getRank();
+  auto elemsPerThread = triton::gpu::getElemsPerThread(dTensorTy);
+  auto batchOffset =
+      elemsPerThread[rank - 2] * elemsPerThread[rank - 1] / numCPackedElem;
+  unsigned colsPerThread = repN * 2;
+
+  auto i32Ty = rewriter.getIntegerType(32);
+
+  int metaElemsPerThread = static_cast<int>(metaElems.size());
+
+  SmallVector<SmallVector<Value>> metaRegs(repM,
+      SmallVector<Value>(repKA));
+  for (int m = 0; m < repM; ++m) {
+    for (int k = 0; k < repKA; ++k) {
+      // Within each MMA we need 2 elements (row and row+8).
+      // With LinearEncoding, these are at indices (m_k * 2) and (m_k * 2 + 1)
+      // where m_k linearizes (m, k) based on register bases layout.
+      int m_k = m * repKA + k;
+      int idx0 = m_k * 2;     // low 16 bits (row)
+      int idx1 = m_k * 2 + 1; // high 16 bits (row+8)
+
+      Value meta0 = (idx0 < metaElemsPerThread)
+                         ? tb.zext(i32Ty, metaElems[idx0])
+                         : tb.i32_val(0);
+      Value meta1 = (idx1 < metaElemsPerThread)
+                         ? tb.zext(i32Ty, metaElems[idx1])
+                         : tb.i32_val(0);
+
+      Value meta1Shifted = tb.shl(meta1, tb.i32_val(16));
+      metaRegs[m][k] = tb.or_(meta0, meta1Shifted);
+    }
+  }
+
+  // Main MMA emission loop.
+  // outer K iterates over repKA; each step consumes 1 A-tile + 2 B-tiles.
+  for (int b = 0; b < repBatch; ++b) {
+    for (int k = 0; k < repKA; ++k) {
+      for (int m = 0; m < repM; ++m) {
+        for (int n = 0; n < repN; ++n) {
+          Value metadataReg = metaRegs[m][k];
+
+          BaseOffset baseA{numRegisters.m * m, numRegisters.n * n,
+                           numRegisters.k * k};
+          // B's k-base: each A k-step corresponds to 2 B k-steps
+          int bKBase = numRegisters.k * k * 2;
+
+          PTXBuilder builder;
+          auto &mma = *builder.create(mmaInstrPtxSparse.at(mmaType));
+
+          callMmaSparse(builder, b, baseA, bKBase, mma, numMmaRets,
+                        colsPerThread, numCPackedElem, batchOffset, ha, hb, fc,
+                        metadataReg);
+
+          Value mmaOut = builder.launch(rewriter, loc,
+                                        getMmaRetType(mmaType, ctx));
+
+          Type elemTy =
+              cast<LLVM::LLVMStructType>(mmaOut.getType()).getBody()[0];
+          for (unsigned i = 0; i < numMmaRets; ++i) {
+            fc[(numRegisters.m * m * colsPerThread +
+                4 * numRegisters.n * n) /
+                   numCPackedElem +
+               i + batchOffset * b] = tb.extract_val(elemTy, mmaOut, i);
+          }
+        }
+      }
+    }
+  }
+
+  // Pack results
+  Type resElemTy = dTensorTy.getElementType();
+  SmallVector<Value> results(fc.size() * numCPackedElem);
+  for (size_t i = 0; i < fc.size(); ++i) {
+    for (int j = 0; j < numCPackedElem; ++j) {
+      results[i * numCPackedElem + j] =
+          numCPackedElem > 1
+              ? tb.bitcast(tb.extract_element(fc[i], tb.i32_val(j)), resElemTy)
+              : tb.bitcast(fc[i], resElemTy);
+    }
+  }
+  Value res =
+      packTensorElements(loc, typeConverter, results, rewriter, dTensorTy);
+  rewriter.replaceOp(op, res);
+  return success();
+}

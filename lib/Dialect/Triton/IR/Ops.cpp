@@ -294,6 +294,57 @@ LogicalResult DotOp::verify() {
                                                      bEncoding);
 }
 
+//-- DotSparseOp --
+bool DotSparseOp::verifyDims() {
+  auto aShape = this->getA().getType().getShape();
+  auto bShape = this->getB().getType().getShape();
+  return aShape[aShape.size() - 1] * 2 == bShape[bShape.size() - 2];
+}
+
+// DotOpInterface's verifier covers the rank, batch and shape relations between
+// $a, $b and $c. It never looks at $aMeta, so check that operand here.
+LogicalResult DotSparseOp::verify() {
+  auto aTy = this->getA().getType();
+  auto metaTy = this->getAMeta().getType();
+  auto aShape = aTy.getShape();
+  auto metaShape = metaTy.getShape();
+
+  if (!metaTy.getElementType().isInteger(16))
+    return this->emitOpError("metadata operand must have i16 element type, "
+                             "but got ")
+           << metaTy.getElementType();
+
+  if (metaShape.size() != aShape.size())
+    return this->emitOpError(
+               "metadata operand must have the same rank as the first "
+               "operand, but got ")
+           << metaShape.size() << " vs " << aShape.size();
+
+  int64_t rank = aShape.size();
+  if (rank == 3 && metaShape[0] != aShape[0])
+    return this->emitOpError("metadata operand batch dimension must match the "
+                             "first operand's, but got ")
+           << metaShape[0] << " vs " << aShape[0];
+
+  if (metaShape[rank - 2] != aShape[rank - 2])
+    return this->emitOpError("metadata operand M dimension must match the "
+                             "first operand's, but got ")
+           << metaShape[rank - 2] << " vs " << aShape[rank - 2];
+
+  // Each i16 of metadata describes 16 dense elements, i.e. 8 elements of $a.
+  int64_t aK = aShape[rank - 1];
+  if (aK % 8 != 0)
+    return this->emitOpError("the first operand's K dimension must be a "
+                             "multiple of 8, but got ")
+           << aK;
+  if (metaShape[rank - 1] != aK / 8)
+    return this->emitOpError("metadata operand K dimension must be the first "
+                             "operand's K divided by 8, expected ")
+           << aK / 8 << " but got " << metaShape[rank - 1];
+
+  return success();
+}
+
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
