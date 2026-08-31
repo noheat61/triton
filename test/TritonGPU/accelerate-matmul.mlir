@@ -1195,6 +1195,31 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+// The 8-bit sparse dot uses mma.sp.m16n8k64, whose metadata mapping differs
+// from the 16-bit one: a thread holds two adjacent metadata columns of one row
+// (register basis [0, 1]) and every lane supplies metadata, so the lane bases
+// carry no broadcast.
+
+// CHECK-DAG: #[[$LINEAR:.+]] = #ttg.linear<{register = {{\[}}[0, 1], [0, 4], [32, 0], [64, 0]], lane = {{\[}}[8, 0], [0, 2], [1, 0], [2, 0], [4, 0]], warp = {{\[}}[0, 0], [16, 0]], block = []}>
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], instrShape = [16, 8]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_i8
+  tt.func public @sparse_dot_i8(%a: tensor<128x64xi8, #blocked>,
+                                %b: tensor<128x128xi8, #blocked>,
+                                %meta: tensor<128x8xi16, #blocked>) -> tensor<128x128xi32, #blocked> {
+    %cst = arith.constant dense<0> : tensor<128x128xi32, #blocked>
+    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x64xi8, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 4}>>
+    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x128xi8, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 4}>>
+    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x8xi16, #[[$LINEAR]]>
+    // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xi32, #[[$MMA]]>
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x64xi8, #blocked> meta tensor<128x8xi16, #blocked> * tensor<128x128xi8, #blocked> -> tensor<128x128xi32, #blocked>
+    tt.return %0 : tensor<128x128xi32, #blocked>
+  }
+}
+
+// -----
+
 // Sparse dot is not converted on sm_90+: those targets have wgmma.sp /
 // tcgen05.mma.sp, and falling back to MMAv2 there would be slower than the
 // dense path. The op must survive the pass unchanged.
@@ -1209,6 +1234,28 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     // CHECK-NOT: ttg.nvidia_mma
     // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xf32, #blocked>
     %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf16, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<128x128xf32, #blocked>
+    tt.return %0 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// Consumer Blackwell (sm_120) has no TMEM and therefore no tcgen05.mma.sp, so
+// like the dense dot it uses MMAv2 -- the sparse path is selected there with
+// the same metadata layout as sm_80-sm_89.
+
+// CHECK-DAG: #[[$LINEAR:.+]] = #ttg.linear<{register = {{\[}}[0, 1], [0, 4], [32, 0], [64, 0]], lane = {{\[}}[8, 0], [0, 2], [1, 0], [2, 0], [4, 0]], warp = {{\[}}[0, 0], [16, 0]], block = []}>
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], instrShape = [16, 8]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:120", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm120
+  tt.func public @sparse_dot_sm120(%a: tensor<128x64xf8E4M3FN, #blocked>,
+                                   %b: tensor<128x128xf8E4M3FN, #blocked>,
+                                   %meta: tensor<128x8xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x8xi16, #[[$LINEAR]]>
+    // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xf32, #[[$MMA]]>
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x64xf8E4M3FN, #blocked> meta tensor<128x8xi16, #blocked> * tensor<128x128xf8E4M3FN, #blocked> -> tensor<128x128xf32, #blocked>
     tt.return %0 : tensor<128x128xf32, #blocked>
   }
 }

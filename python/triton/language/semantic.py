@@ -1546,7 +1546,8 @@ class TritonSemantic(Generic[TensorTy]):
         return self.tensor(
             self.builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc), ret_ty)
 
-    def dot_sparse(self, lhs: TensorTy, rhs: TensorTy, lhs_meta: TensorTy, acc: TensorTy) -> TensorTy:
+    def dot_sparse(self, lhs: TensorTy, rhs: TensorTy, lhs_meta: TensorTy, acc: TensorTy,
+                   out_dtype: tl.dtype | None = None) -> TensorTy:
         assert lhs.type.is_block() and rhs.type.is_block()
 
         supported_sparse_dot_dtypes = self.builder.codegen_fns.get("supported_sparse_dot_dtypes")
@@ -1557,7 +1558,10 @@ class TritonSemantic(Generic[TensorTy]):
             f"Unsupported lhs dtype {lhs.dtype} for dot_sparse on this target"
         assert supported_sparse_dot_dtypes(rhs.dtype), \
             f"Unsupported rhs dtype {rhs.dtype} for dot_sparse on this target"
-        assert lhs.dtype == rhs.dtype, f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
+        # mma.sp takes independent .atype/.btype, so as for the dense dot any
+        # combination of supported fp8 types is permitted.
+        if not (lhs.dtype.is_fp8() and rhs.dtype.is_fp8()):
+            assert lhs.dtype == rhs.dtype, f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
 
         lhs_rank = len(lhs.shape)
         rhs_rank = len(rhs.shape)
@@ -1584,8 +1588,30 @@ class TritonSemantic(Generic[TensorTy]):
             and rhs.shape[-1].value >= min_dot_size[1], \
                 f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
 
-        _0 = self.builder.get_fp32(0)
-        ret_scalar_ty = tl.float32
+        # int8 inputs accumulate in int32, like the dense int8 dot; every other
+        # supported input type (fp16/bf16/fp8) accumulates in fp32 unless the
+        # caller asks for an fp16 accumulator.
+        if out_dtype is None:
+            out_dtype = tl.float32 if acc is None else acc.type.element_ty
+        if lhs.type.scalar.is_int():
+            assert lhs.type.scalar == tl.int8, "only int8 supported!"
+            assert out_dtype in (tl.int32, tl.float32), \
+                f"out_dtype={out_dtype} is unsupported for integer dot_sparse; it accumulates in int32"
+            _0 = self.builder.get_int32(0)
+            ret_scalar_ty = tl.int32
+        elif out_dtype.is_fp16():
+            # `mma.sp` only has an fp16 accumulator for fp16 inputs: ptxas rejects
+            # it for bf16 and for fp8. It halves the accumulator's precision, so
+            # it is never chosen implicitly.
+            assert lhs.dtype.is_fp16() and rhs.dtype.is_fp16(), \
+                f"out_dtype=float16 requires float16 inputs for dot_sparse. Got {lhs.dtype} and {rhs.dtype}"
+            _0 = self.builder.get_fp16(0)
+            ret_scalar_ty = tl.float16
+        else:
+            assert out_dtype.is_fp32(), \
+                f"out_dtype={out_dtype} is unsupported for dot_sparse. Use float32 or float16"
+            _0 = self.builder.get_fp32(0)
+            ret_scalar_ty = tl.float32
 
         M = lhs.type.shape[-2]
         N = rhs.type.shape[-1]

@@ -970,16 +970,58 @@ inline static const std::map<TensorCoreType, std::string> mmaInstrPtxSparse = {
      "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32"},
     {TensorCoreType::FP32_BF16_BF16_FP32,
      "mma.sp.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32"},
+    // An fp16 accumulator halves the accumulator's precision but runs at twice
+    // the rate on GPUs whose fp32-accumulate MMA is half rate (all consumer
+    // parts so far). PTX only offers it for fp16 inputs -- ptxas rejects an
+    // fp16 accumulator for bf16 and for the fp8 types -- and the frontend only
+    // selects it when the user passes out_dtype=float16.
+    {TensorCoreType::FP16_FP16_FP16_FP16,
+     "mma.sp.sync.aligned.m16n8k32.row.col.f16.f16.f16.f16"},
+    // 8-bit operands double the instruction's K. PTX ISA defines the metadata
+    // layout of the integer and fp8 variants in the same section, so they all
+    // share getSparseMetadataLayout()'s m16n8k64 mapping.
+    {TensorCoreType::INT32_INT8_INT8_INT32,
+     "mma.sp.sync.aligned.m16n8k64.row.col.satfinite.s32.s8.s8.s32"},
+    {TensorCoreType::FP32_FP8E4M3FN_FP8E4M3FN_FP32,
+     "mma.sp.sync.aligned.m16n8k64.row.col.f32.e4m3.e4m3.f32"},
+    {TensorCoreType::FP32_FP8E4M3FN_FP8E5M2_FP32,
+     "mma.sp.sync.aligned.m16n8k64.row.col.f32.e4m3.e5m2.f32"},
+    {TensorCoreType::FP32_FP8E5M2_FP8E4M3FN_FP32,
+     "mma.sp.sync.aligned.m16n8k64.row.col.f32.e5m2.e4m3.f32"},
+    {TensorCoreType::FP32_FP8E5M2_FP8E5M2_FP32,
+     "mma.sp.sync.aligned.m16n8k64.row.col.f32.e5m2.e5m2.f32"},
 };
 
 static TensorCoreType getMmaTypeSparseDot(RankedTensorType aTy,
                                           RankedTensorType bTy,
                                           RankedTensorType dTy) {
+  Type aElemTy = aTy.getElementType();
+  Type bElemTy = bTy.getElementType();
   if (dTy.getElementType().isF32()) {
-    if (aTy.getElementType().isF16() && bTy.getElementType().isF16())
+    if (aElemTy.isF16() && bElemTy.isF16())
       return TensorCoreType::FP32_FP16_FP16_FP32;
-    if (aTy.getElementType().isBF16() && bTy.getElementType().isBF16())
+    if (aElemTy.isBF16() && bElemTy.isBF16())
       return TensorCoreType::FP32_BF16_BF16_FP32;
+    if (llvm::isa<Float8E4M3FNType>(aElemTy) &&
+        llvm::isa<Float8E4M3FNType>(bElemTy))
+      return TensorCoreType::FP32_FP8E4M3FN_FP8E4M3FN_FP32;
+    if (llvm::isa<Float8E4M3FNType>(aElemTy) &&
+        llvm::isa<Float8E5M2Type>(bElemTy))
+      return TensorCoreType::FP32_FP8E4M3FN_FP8E5M2_FP32;
+    if (llvm::isa<Float8E5M2Type>(aElemTy) &&
+        llvm::isa<Float8E4M3FNType>(bElemTy))
+      return TensorCoreType::FP32_FP8E5M2_FP8E4M3FN_FP32;
+    if (llvm::isa<Float8E5M2Type>(aElemTy) &&
+        llvm::isa<Float8E5M2Type>(bElemTy))
+      return TensorCoreType::FP32_FP8E5M2_FP8E5M2_FP32;
+  } else if (dTy.getElementType().isInteger(32)) {
+    // Triton's IR has signless integers, so i8 operands always lower to the
+    // signed .s8 variant, matching the dense int8 dot.
+    if (aElemTy.isInteger(8) && bElemTy.isInteger(8))
+      return TensorCoreType::INT32_INT8_INT8_INT32;
+  } else if (dTy.getElementType().isF16()) {
+    if (aElemTy.isF16() && bElemTy.isF16())
+      return TensorCoreType::FP16_FP16_FP16_FP16;
   }
   return TensorCoreType::NOT_APPLICABLE;
 }
@@ -987,13 +1029,13 @@ static TensorCoreType getMmaTypeSparseDot(RankedTensorType aTy,
 // Emit one mma.sp.sync PTX instruction.
 // A: 4 regs (same as dense m16n8k16), B: 4 regs (2x dense), metadata: 1 i32.
 static void callMmaSparse(PTXBuilder &builder, int b, const BaseOffset &baseA,
-                           int bKBase,
-                           mlir::triton::PTXInstr &mma, unsigned numMmaRets,
-                           unsigned colsPerThread, int numCPackedElem,
-                           unsigned batchOffset, ValueTableV2 &ha,
-                           ValueTableV2 &hb, const SmallVector<Value> &fc,
-                           Value metadataReg) {
-  auto retArgs = builder.newListOperand(numMmaRets, "=f");
+                          int bKBase, mlir::triton::PTXInstr &mma,
+                          unsigned numMmaRets, unsigned colsPerThread,
+                          int numCPackedElem, unsigned batchOffset,
+                          ValueTableV2 &ha, ValueTableV2 &hb,
+                          const SmallVector<Value> &fc, Value metadataReg,
+                          const std::string &constraintRet) {
+  auto retArgs = builder.newListOperand(numMmaRets, constraintRet);
   auto cArgs = builder.newListOperand();
   for (unsigned i = 0; i < numMmaRets; ++i) {
     cArgs->listAppend(builder.newOperand(
@@ -1083,26 +1125,15 @@ LogicalResult convertMMASparseDot(triton::DotSparseOp op,
   // Load C
   auto fc = loadC(op.getC(), adaptor.getC(), loc, rewriter);
 
-  // Extract metadata values from LinearEncoding-annotated metadata tensor.
-  // The custom LinearEncoding in AccelerateMatmul places elements per thread
-  // in this order (from our basis vector construction):
-  //   register 0: (row+8, col)   → 2nd element of current MMA
-  //   register 1: +extra K-group → adjacent K-col (for repKA > 1)
-  //   register 2+: more K-groups or M-tiles
-  //
-  // For each MMA at (m_rep, k_rep), thread T gets:
-  //   E[15:0]  = meta[T>>2 + m_rep*16*warpsM][T%4 + k_rep*...] (low reg)
-  //   E[31:16] = meta[T>>2 + m_rep*16*warpsM + 8][T%4 + k_rep*...] (high reg)
-  //
-  // Per-thread element array ordering:
-  //   idx = (k_extra * 2 + reg0) where reg0 ∈ {0, 1} for (row, row+8)
-  //
-  // With our register basis [{8,0}, {0,4}, {0,8}, ...], the linear index
-  // order for elements within a thread is:
-  //   idx = reg_bit0 * 1 + reg_bit1 * 2 + ...
-  //   = (row_offset_selector) + (k_group_offset_selector) << 1
-  //
-  // For one MMA k_rep: take idx 2*k_rep and 2*k_rep+1
+  // Extract metadata values from the LinearEncoding-annotated metadata tensor.
+  // getSparseMetadataLayout() orders the register bases so that a thread's
+  // elements come out as
+  //   idx = half + 2 * k_rep + 2 * repKA * m_rep
+  // where `half` (register bit 0) is the element the hardware reads from the
+  // upper 16 bits of the metadata operand: the next row for m16n8k32, the next
+  // metadata column for m16n8k64. Which one it is only matters inside that
+  // function; here the two halves of one MMA are always idx 2*m_k and
+  // 2*m_k + 1, packed low and high.
   auto metaElems = unpackTensorElements(loc, adaptor.getAMeta(), rewriter,
                                         op.getAMeta().getType());
 
@@ -1110,8 +1141,13 @@ LogicalResult convertMMASparseDot(triton::DotSparseOp op,
   MLIRContext *ctx = op->getContext();
 
   int bitwidthRet = dTensorTy.getElementType().getIntOrFloatBitWidth();
-  auto numMmaRets = static_cast<unsigned>(bitwidthRet / 8); // 4 for f32
-  int numCPackedElem = 4 / static_cast<int>(numMmaRets);    // 1 for f32
+  auto numMmaRets = static_cast<unsigned>(bitwidthRet / 8); // 4 for f32/i32
+  int numCPackedElem = 4 / static_cast<int>(numMmaRets);    // 1 for f32/i32
+  // i32 (int8 inputs) and packed f16x2 accumulators live in general-purpose
+  // registers; only an f32 accumulator uses "=f", as in the dense path.
+  Type retElemTy = dTensorTy.getElementType();
+  std::string constraintRet =
+      (retElemTy.isInteger(32) || retElemTy.isF16()) ? "=r" : "=f";
 
   auto rank = dTensorTy.getRank();
   auto elemsPerThread = triton::gpu::getElemsPerThread(dTensorTy);
@@ -1164,7 +1200,7 @@ LogicalResult convertMMASparseDot(triton::DotSparseOp op,
 
           callMmaSparse(builder, b, baseA, bKBase, mma, numMmaRets,
                         colsPerThread, numCPackedElem, batchOffset, ha, hb, fc,
-                        metadataReg);
+                        metadataReg, constraintRet);
 
           Value mmaOut = builder.launch(rewriter, loc,
                                         getMmaRetType(mmaType, ctx));

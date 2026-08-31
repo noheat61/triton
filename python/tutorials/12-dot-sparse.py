@@ -1,7 +1,17 @@
-"""NVIDIA 2:4 sparsity tutorial with dedicated SparseMetadataEncodingAttr.
+"""NVIDIA 2:4 structured sparsity with tl.dot_sparse.
 
-Supports multi-warp and large tile sizes. Metadata uses its own distributed
-encoding which allows natural N-warp duplication (unlike LinearEncoding).
+Supports multi-warp and large tile sizes. The metadata operand is laid out with
+a LinearEncoding whose broadcast (zero) bases express its duplication across the
+parent MMA's N-warps, so no dedicated encoding attribute is needed.
+
+Two knobs worth knowing about, neither of which this tutorial uses:
+
+* 8-bit operands (int8/fp8) need `b` laid out K-contiguously, because the 8-bit
+  `ldmatrix` cannot transpose below Blackwell. fp8 GEMM libraries require the same
+  layout, so this is the usual convention rather than a limitation of this path.
+* `out_dtype=tl.float16` (fp16 inputs only) accumulates in fp16, which is faster
+  on parts whose fp32-accumulate MMA is half rate, at the cost of accumulation
+  precision. The default stays fp32.
 """
 import random
 import numpy as np

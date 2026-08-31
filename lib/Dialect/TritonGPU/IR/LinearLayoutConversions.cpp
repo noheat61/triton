@@ -1031,19 +1031,17 @@ DotOperandEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
 LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
                                      ArrayRef<unsigned> warpsPerCTA,
-                                     CGAEncodingAttr cgaLayout) {
-  // Metadata thread mapping for mma.sp m16n8k32 fp16/bf16 (selector=0):
-  //   Thread T: E[15:0]  = meta[row=T>>2][col=T%4]
-  //             E[31:16] = meta[row=(T>>2)+8][col=T%4]
-  //
-  // The resulting bases are:
+                                     CGAEncodingAttr cgaLayout,
+                                     unsigned elemBitWidth) {
+  // Metadata thread mapping for mma.sp with selector=0. One int16 of metadata
+  // describes 16 dense K elements, so one MMA spans
+  // `instrKDense / 16` metadata columns: 2 for m16n8k32 (16-bit operands),
+  // 4 for m16n8k64 (8-bit operands). The per-instruction mappings are spelled
+  // out where the register and lane bases are built below; on top of them this
+  // function adds:
   //   register:
-  //     (8, 0)            -- row+8 for second element
-  //     (0, 2), (0, 4)... -- K-group strides per repKA (metaK beyond 2 cols)
+  //     (0, c), (0, 2c)...-- K-group strides per repKA (metaK beyond one MMA)
   //     (16*wm, 0)...     -- M-rep strides when metaM > 16*warpsM
-  //   lane (5 bits, 32):
-  //     (0, 1), (0, 0)    -- col = T%4; bit 1 is a broadcast basis
-  //     (1, 0), (2, 0), (4, 0) -- row = T>>2
   //   warp:
   //     (0, 0)...         -- N-warp: metadata duplicated (broadcast basis)
   //     (16, 0)...        -- M-warp: each warp covers next 16 rows
@@ -1055,24 +1053,42 @@ LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
 
   assert(shape.size() == 2 && "sparse metadata expects a rank-2 tensor");
   assert(warpsPerCTA.size() == 2 && "warp layout must match metadata rank");
+  assert((elemBitWidth == 16 || elemBitWidth == 8) &&
+         "sparse dot supports 16-bit and 8-bit operands");
   int64_t metaM = shape[0];
   int64_t metaK = shape[1];
+  // Metadata columns covered by one MMA: m16n8k32 -> 32/16 = 2 columns,
+  // m16n8k64 -> 64/16 = 4 columns.
+  int64_t metaColsPerInstr = elemBitWidth == 16 ? 2 : 4;
 
-  // Register bases: start with row+8 for the second element per thread.
-  std::vector<std::vector<int32_t>> regBases = {{8, 0}};
+  // Register and lane bases. The two instructions distribute the metadata
+  // differently, so this is not a shared formula with a swapped bit.
+  std::vector<std::vector<int32_t>> regBases;
+  std::vector<std::vector<int32_t>> laneBases;
+  if (metaColsPerInstr == 2) {
+    // m16n8k32: 16 rows x 2 cols x 16 bits = 512 bits, half of what the warp's
+    // 32-bit operands hold, so one lane bit is left over.
+    //   row = T>>2, col = T%2, T%4's msb unused (the hardware reads it as the
+    //   sparsity selector's input, hence the broadcast basis)
+    //   E[15:0] = meta[row][col], E[31:16] = meta[row + 8][col]
+    regBases = {{8, 0}};
+    laneBases = {{0, 1}, {0, 0}, {1, 0}, {2, 0}, {4, 0}};
+  } else {
+    // m16n8k64: 16 rows x 4 cols x 16 bits = 1024 bits fills every lane's
+    // 32-bit operand, so no lane bit is left over and a thread holds two
+    // adjacent columns of one row instead of two rows of one column:
+    //   row = (T>>2) + 8*(T&1), col = 2*((T>>1)&1)
+    //   E[15:0] = meta[row][col], E[31:16] = meta[row][col + 1]
+    // Probed against sm_89 hardware; the PTX ISA documents this mapping in
+    // "Matrix Fragments for sparse mma.m16n8k64" (.u8/.s8/.e4m3/.e5m2).
+    regBases = {{0, 1}};
+    laneBases = {{8, 0}, {0, 2}, {1, 0}, {2, 0}, {4, 0}};
+  }
 
-  // Lane bases for m16n8k32 metadata.
-  //   bit 0 (T%2 lsb)    -> (0, 1) col bit 0
-  //   bit 1 (T%4 msb)    -> (0, 0) duplicate (HW uses this as selector input)
-  //   bits 2..4 (T>>2)   -> (1, 0), (2, 0), (4, 0) row
-  std::vector<std::vector<int32_t>> laneBases = {
-      {0, 1}, {0, 0}, {1, 0}, {2, 0}, {4, 0},
-  };
-
-  // K-group register extension: each MMA uses 2 K-cols. The 2-col offset
-  // lives in a register bit (never lane) so HW's selector-switching works
-  // correctly across k_reps (selector=0 for even k_rep, =1 for odd k_rep).
-  for (int64_t c = 2; c < metaK; c *= 2) {
+  // K-group register extension: metadata columns beyond the ones one MMA
+  // consumes live in register bits (never lane), so each MMA still finds its
+  // own columns in the lanes the hardware reads them from.
+  for (int64_t c = metaColsPerInstr; c < metaK; c *= 2) {
     regBases.push_back({0, (int32_t)c});
   }
 

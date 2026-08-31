@@ -5685,7 +5685,7 @@ def test_inline_asm_packed(num_ctas, device):
         # shift 4x8bits values together.
         y = tl.inline_asm_elementwise(
             "and.b32 $0, $1, 0x1F1F1F1F; \
-                                       shl.b32 $0, $0, 3;", "=r,r", [
+                                       shl.b32 $0, $0, 3;"                                                                                                                                                                              , "=r,r", [
                 x,
             ], dtype=tl.int8, is_pure=True, pack=4)
         tl.store(Y + tl.arange(0, BLOCK), y)
@@ -5713,7 +5713,7 @@ def test_inline_asm_with_pointers(num_ctas, device):
         tl.inline_asm_elementwise(
             "ld.global.b8 $0, [$1]; \
                                    shl.b32 $0, $0, 3; \
-                                   st.global.b8 [$2], $0;", "=r,l,l", [x_ptrs, y_ptrs], dtype=tl.int8, is_pure=False,
+                                   st.global.b8 [$2], $0;"                                                                                                                                                                              , "=r,l,l", [x_ptrs, y_ptrs], dtype=tl.int8, is_pure=False,
             pack=1)
 
     shape = (512, )
@@ -7587,8 +7587,8 @@ def test_dot_sparse_valid_ttir(fresh_triton_cache):
     options = backend.parse_options({})
     context = triton._C.libtriton.ir.context()
     backend.load_dialects(context)
-    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                         backend.get_module_map(), context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                         context)
     ir_str = str(module)
     assert "tt.dot_sparse" in ir_str
 
@@ -7613,8 +7613,8 @@ def test_dot_sparse_valid_ttir_bf16(fresh_triton_cache):
     options = backend.parse_options({})
     context = triton._C.libtriton.ir.context()
     backend.load_dialects(context)
-    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                         backend.get_module_map(), context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                         context)
     ir_str = str(module)
     assert "tt.dot_sparse" in ir_str
 
@@ -7640,10 +7640,167 @@ def test_dot_sparse_valid_ttir_with_acc(fresh_triton_cache):
     options = backend.parse_options({})
     context = triton._C.libtriton.ir.context()
     backend.load_dialects(context)
-    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                         backend.get_module_map(), context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                         context)
     ir_str = str(module)
     assert "tt.dot_sparse" in ir_str
+
+
+def _compress_24(a_dense):
+    """Split a 2:4 dense matrix into (kept values, int16 metadata)."""
+    flat = a_dense.flatten().to(torch.float64).cpu().numpy()
+    kept, nibbles = [], []
+    for base in range(0, len(flat), 4):
+        nibble = count = 0
+        for i in range(4):
+            if flat[base + i] != 0:
+                kept.append(base + i)
+                nibble |= i << (2 * count)
+                count += 1
+        assert count == 2, "every group of four must keep exactly two elements"
+        nibbles.append(nibble)
+    # One int16 packs the nibbles of four groups, i.e. 16 dense elements.
+    metas = [sum(nibbles[b + i] << (4 * i) for i in range(4)) for b in range(0, len(nibbles), 4)]
+    M, K = a_dense.shape
+    a_sparse = torch.tensor(flat[kept], device=a_dense.device).reshape(M, K // 2)
+    meta = torch.tensor(np.array(metas, dtype=np.uint16).astype(np.int16), device=a_dense.device)
+    return a_sparse, meta.reshape(M, K // 16)
+
+
+def _make_24_operands(M, N, K, values, device):
+    """Dense lhs with a 2:4 pattern along K, plus a dense rhs, both exact."""
+    rs = RandomState(17)
+    pick = lambda shape: torch.tensor(  # noqa: E731
+        np.asarray(values, dtype=np.float64)[rs.randint(len(values), size=shape)], device=device, dtype=torch.float64)
+    a_dense = pick((M, K))
+    for i in range(M):
+        for j in range(0, K, 4):
+            drop = rs.choice(4, size=2, replace=False)
+            a_dense[i, j + drop[0]] = 0
+            a_dense[i, j + drop[1]] = 0
+    return a_dense, pick((K, N))
+
+
+# (M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps); K is the dense K.
+sparse_dot_shapes = [
+    (16, 8, 64, 16, 8, 64, 1),  # one MMA tile
+    (32, 32, 128, 32, 32, 64, 1),  # several K steps
+    (32, 32, 128, 32, 32, 128, 1),  # several K groups within one dot
+    (64, 64, 128, 64, 64, 64, 2),  # multiple warps
+    (128, 128, 128, 64, 64, 64, 4),
+]
+
+
+@pytest.mark.parametrize("in_dtype", ["float16", "bfloat16", "int8", "float8e4nv", "float8e5"])
+@pytest.mark.parametrize("M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps", sparse_dot_shapes)
+def test_dot_sparse(in_dtype, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps, device):
+    """dot_sparse against a dense reference, with exactly representable inputs.
+
+    Every value is exact in all of the tested dtypes and the products fit in the
+    accumulator exactly, so a mismatch means a wrong metadata layout rather than
+    rounding.
+    """
+    if not is_cuda():
+        pytest.skip("NVIDIA backend only")
+    capability = torch.cuda.get_device_capability()
+    cc = capability[0] * 10 + capability[1]
+    if not (80 <= cc < 90 or 120 <= cc < 130):
+        pytest.skip("sparse dot lowers to mma.sp (MMAv2), used on sm_80-sm_89 and sm_120+")
+    if in_dtype.startswith("float8") and cc < 89:
+        pytest.skip("the fp8 flavours of mma.sp.m16n8k64 need sm_89")
+
+    is_int = in_dtype == "int8"
+    # int8 accumulates in int32, everything else in fp32.
+    values = list(range(-4, 0)) + list(range(1, 5)) if is_int else [-2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0]
+    a_dense, b_dense = _make_24_operands(M, N, K, values, device)
+    a_sparse, meta = _compress_24(a_dense)
+    ref = torch.matmul(a_dense, b_dense)
+
+    torch_dtype = getattr(torch, {"float8e4nv": "float8_e4m3fn", "float8e5": "float8_e5m2"}.get(in_dtype, in_dtype))
+    a = a_sparse.to(torch_dtype)
+    b = b_dense.to(torch_dtype)
+    c = torch.zeros((M, N), device=device, dtype=torch.int32 if is_int else torch.float32)
+
+    @triton.jit
+    def kernel(a_ptr, b_ptr, c_ptr, meta_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+               stride_mm, stride_mk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+               IS_INT: tl.constexpr):
+        offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + tl.arange(0, BLOCK_K // 2)[None, :] * stride_ak
+        b_ptrs = b_ptr + tl.arange(0, BLOCK_K)[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        m_ptrs = meta_ptr + offs_m[:, None] * stride_mm + tl.arange(0, BLOCK_K // 16)[None, :] * stride_mk
+        if IS_INT:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for _ in range(0, tl.cdiv(K, BLOCK_K)):
+            acc = tl.dot_sparse(tl.load(a_ptrs), tl.load(b_ptrs), tl.load(m_ptrs), acc)
+            a_ptrs += (BLOCK_K // 2) * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+            m_ptrs += (BLOCK_K // 16) * stride_mk
+        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+    kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))](a, b, c, meta, M, N, K, a.stride(0), a.stride(1),
+                                                               b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+                                                               meta.stride(0), meta.stride(1), BLOCK_M=BLOCK_M,
+                                                               BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, IS_INT=is_int,
+                                                               num_warps=num_warps)
+
+    torch.testing.assert_close(c.to(torch.float64), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps", sparse_dot_shapes)
+def test_dot_sparse_fp16_accumulator(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps, device):
+    """out_dtype=float16 selects mma.sp's fp16 accumulator.
+
+    That accumulator is faster on GPUs whose fp32-accumulate MMA is half rate,
+    at the cost of precision, so this checks the result against an fp64 reference
+    with a tolerance instead of exactly: the error grows like sqrt(K) and lands
+    around 1e-3 relative for these sizes.
+    """
+    if not is_cuda():
+        pytest.skip("NVIDIA backend only")
+    capability = torch.cuda.get_device_capability()
+    cc = capability[0] * 10 + capability[1]
+    if not (80 <= cc < 90 or 120 <= cc < 130):
+        pytest.skip("sparse dot lowers to mma.sp (MMAv2), used on sm_80-sm_89 and sm_120+")
+
+    values = [-2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0]
+    a_dense, b_dense = _make_24_operands(M, N, K, values, device)
+    a_sparse, meta = _compress_24(a_dense)
+    ref = torch.matmul(a_dense, b_dense)
+
+    a = a_sparse.to(torch.float16)
+    b = b_dense.to(torch.float16)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+
+    @triton.jit
+    def kernel(a_ptr, b_ptr, c_ptr, meta_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+               stride_mm, stride_mk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + tl.arange(0, BLOCK_K // 2)[None, :] * stride_ak
+        b_ptrs = b_ptr + tl.arange(0, BLOCK_K)[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        m_ptrs = meta_ptr + offs_m[:, None] * stride_mm + tl.arange(0, BLOCK_K // 16)[None, :] * stride_mk
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+        for _ in range(0, tl.cdiv(K, BLOCK_K)):
+            acc = tl.dot_sparse(tl.load(a_ptrs), tl.load(b_ptrs), tl.load(m_ptrs), acc, out_dtype=tl.float16)
+            a_ptrs += (BLOCK_K // 2) * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+            m_ptrs += (BLOCK_K // 16) * stride_mk
+        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+    kernel[(triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))](a, b, c, meta, M, N, K, a.stride(0), a.stride(1),
+                                                               b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+                                                               meta.stride(0), meta.stride(1), BLOCK_M=BLOCK_M,
+                                                               BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=num_warps)
+
+    got = c.to(torch.float64)
+    rel = ((got - ref).pow(2).sum().sqrt() / ref.pow(2).sum().sqrt()).item()
+    assert rel < 5e-3, f"fp16 accumulator relative error {rel:.2e} is larger than expected"
 
 
 @pytest.mark.skipif(not is_cuda(), reason="NVIDIA backend only")
@@ -7667,7 +7824,7 @@ def test_dot_sparse_valid_ttir_3d(fresh_triton_cache):
     options = backend.parse_options({})
     context = triton._C.libtriton.ir.context()
     backend.load_dialects(context)
-    module = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                         backend.get_module_map(), context)
+    module = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                         context)
     ir_str = str(module)
     assert "tt.dot_sparse" in ir_str

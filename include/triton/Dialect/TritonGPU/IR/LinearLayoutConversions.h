@@ -154,12 +154,15 @@ LinearLayout getSM120DotScaledScaleLayout(MLIRContext *ctx,
                                           CGAEncodingAttr cgaLayout);
 
 // Layout of the metadata operand of `tt.dot_sparse`, matching the
-// thread-to-metadata mapping of `mma.sp.sync.aligned.m16n8k32` (fp16/bf16,
-// selector 0).  The metadata is replicated across the parent MMA's N-warps,
-// which this layout expresses with broadcast (zero) bases.
+// thread-to-metadata mapping of `mma.sp.sync.aligned` with selector 0.
+// `elemBitWidth` is the bit width of the sparse operands and picks the
+// instruction: 16 bits use m16n8k32, 8 bits use m16n8k64.  The metadata is
+// replicated across the parent MMA's N-warps, which this layout expresses
+// with broadcast (zero) bases.
 LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
                                      ArrayRef<unsigned> warpsPerCTA,
-                                     CGAEncodingAttr cgaLayout);
+                                     CGAEncodingAttr cgaLayout,
+                                     unsigned elemBitWidth);
 
 // Create LinearLayout for nvidia mma tile.
 LinearLayout nvidiaMmaTile(MLIRContext *ctx, ArrayRef<unsigned> tileShape,

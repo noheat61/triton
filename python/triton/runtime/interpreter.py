@@ -410,7 +410,8 @@ class InterpreterBuilder:
         self.codegen_fns["convert_custom_types"] = ExtraFunctions._convert_custom_types
         self.codegen_fns["min_dot_size"] = lambda lhsType, rhsType: (1, 1, 1)
         self.codegen_fns["min_sparse_dot_size"] = lambda lhsType, rhsType: (1, 1, 4)
-        self.codegen_fns["supported_sparse_dot_dtypes"] = lambda input_dtype: input_dtype.name in ("fp16", "bf16")
+        self.codegen_fns["supported_sparse_dot_dtypes"] = \
+            lambda input_dtype: input_dtype.name in ("fp16", "bf16", "int8", "fp8e4nv", "fp8e5")
 
     def set_grid_idx(self, x, y, z):
         if not x < self.grid_dim[0]:

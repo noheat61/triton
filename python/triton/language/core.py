@@ -2339,7 +2339,7 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
 
 
 @builtin
-def dot_sparse(input, other, input_meta, acc=None, _semantic=None):
+def dot_sparse(input, other, input_meta, acc=None, out_dtype=None, _semantic=None):
     """
     Returns the matrix product of two blocks and a third metadata block, where the first block is 2:4 structurally sparse and the second block is dense.
     The third metadata block describes which 2 out of 4 consecutive elements in the first input are zero.
@@ -2365,9 +2365,17 @@ def dot_sparse(input, other, input_meta, acc=None, _semantic=None):
     :param input_meta: The 2:4 metadata for `input`.
     :type input_meta: 2D or 3D tensor of scalar-type :code:`int16`
     :param acc: The accumulator tensor. If not None, the result is added to this tensor.
-    :type acc: 2D or 3D tensor of scalar-type in {:code:`float32`}
+    :type acc: 2D or 3D tensor whose scalar-type matches `out_dtype`
+    :param out_dtype: The accumulator and result dtype. Defaults to :code:`float32`
+        (:code:`int32` for integer inputs). :code:`float16` is only accepted for
+        :code:`float16` inputs; it lets the hardware accumulate in fp16, which is
+        up to twice as fast on consumer GPUs but accumulates rounding error, so it
+        has to be requested explicitly.
+    :type out_dtype: tl.dtype, optional
     """
-    return _semantic.dot_sparse(input, other, input_meta, acc)
+    out_dtype = _unwrap_if_constexpr(out_dtype)
+    acc = _unwrap_if_constexpr(acc)
+    return _semantic.dot_sparse(input, other, input_meta, acc, out_dtype)
 
 
 # -----------------------

@@ -53,15 +53,30 @@ def get_min_sparse_dot_size(target: GPUTarget):
 
 def get_supported_sparse_dot_dtypes(target: GPUTarget):
     capability = target.arch
-    # Sparse dot currently lowers to `mma.sp.sync` (MMAv2), which this backend
-    # only selects on sm_80-sm_89. Hopper and later have their own sparse
-    # instructions (wgmma.sp, tcgen05.mma.sp) that are not implemented yet, and
-    # silently falling back to MMAv2 there would be much slower than the dense
-    # `tl.dot` those targets use, so reject instead.
-    if 80 <= capability < 90:
-        return lambda input_dtype: input_dtype.name in ("fp16", "bf16")
-    else:
+    # Sparse dot lowers to `mma.sp.sync` (MMAv2), which this backend selects on
+    # sm_80-sm_89 and again on consumer Blackwell (sm_120+): those parts have no
+    # TMEM, so `tcgen05.mma.sp` is unavailable there and `mma.sp.sync` is the
+    # sparse instruction, exactly as for the dense dot. Hopper and datacenter
+    # Blackwell instead have wgmma.sp / tcgen05.mma.sp; falling back to MMAv2
+    # there would be slower than the dense `tl.dot` those targets use, so
+    # reject until those paths are implemented.
+    if not (80 <= capability < 90 or 120 <= capability < 130):
         return lambda input_dtype: False
+
+    def is_supported(input_dtype):
+        # mma.sp.sync.aligned.m16n8k32
+        if input_dtype.name in ("fp16", "bf16"):
+            return True
+        # mma.sp.sync.aligned.m16n8k64. Triton's IR has signless integers, so
+        # only the signed .s8 variant is reachable, as for the dense int8 dot.
+        if input_dtype.name == "int8":
+            return True
+        # The fp8 flavours of m16n8k64 need sm_89 (ptxas rejects them below).
+        if input_dtype.name in ("fp8e4nv", "fp8e5"):
+            return capability >= 89
+        return False
+
+    return is_supported
 
 
 def get_ptxas(arch: int) -> knobs.NvidiaTool:

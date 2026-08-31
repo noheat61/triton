@@ -589,10 +589,14 @@ public:
   matchAndRewrite(triton::DotSparseOp dotOp,
                   mlir::PatternRewriter &rewriter) const override {
     // Sparse MMA only exists as MMAv2 (mma.sp.sync) here, which is selected on
-    // sm_80-sm_89. Hopper and later have wgmma.sp / tcgen05.mma.sp instead;
-    // until those are implemented, leave the op alone rather than falling back
-    // to MMAv2, which would be slower there than the dense path.
-    if (computeCapability < 80 || computeCapability >= 90)
+    // sm_80-sm_89 and again on consumer Blackwell (sm_120+), which has no TMEM
+    // and therefore no tcgen05.mma.sp -- the same reason getMMAVersionSafe
+    // picks MMAv2 there for the dense dot. Hopper and datacenter Blackwell have
+    // wgmma.sp / tcgen05.mma.sp instead; until those are implemented, leave the
+    // op alone rather than falling back to MMAv2, which would be slower there
+    // than the dense path.
+    if (!((computeCapability >= 80 && computeCapability < 90) ||
+          (computeCapability >= 120 && computeCapability < 130)))
       return failure();
 
     auto retType = cast<RankedTensorType>(dotOp.getType());
@@ -633,7 +637,7 @@ public:
       MLIRContext *ctx = rewriter.getContext();
       auto ll = triton::gpu::getSparseMetadataLayout(
           ctx, metaTy.getShape(), mmaResult.mmaEnc.getWarpsPerCTA(),
-          mmaResult.mmaEnc.getCGALayout());
+          mmaResult.mmaEnc.getCGALayout(), static_cast<unsigned>(minBitwidth));
       auto metaEncoding =
           triton::gpu::LinearEncodingAttr::get(ctx, std::move(ll));
       auto newMetaTy = metaTy.cloneWithEncoding(metaEncoding);

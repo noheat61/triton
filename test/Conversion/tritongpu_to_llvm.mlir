@@ -3282,3 +3282,57 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
     tt.return
   }
 }
+
+// -----
+
+// out_dtype=float16 selects mma.sp's fp16 accumulator, which is twice as fast on
+// parts whose fp32-accumulate MMA is half rate. Only fp16 inputs have it.
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [16, 8]}>
+#linear = #ttg.linear<{register = [[8, 0]], lane = [[0, 1], [0, 0], [1, 0], [2, 0], [4, 0]], warp = [], block = []}>
+module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_mmav2_f16_acc
+  tt.func @sparse_dot_mmav2_f16_acc(%a: tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>,
+                                    %b: tensor<32x8xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>,
+                                    %meta: tensor<16x2xi16, #linear>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<16x8xf16, #mma>
+    // CHECK: mma.sp.sync.aligned.m16n8k32.row.col.f16.f16.f16.f16
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> meta tensor<16x2xi16, #linear> * tensor<32x8xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<16x8xf16, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// The 8-bit sparse dot doubles the instruction's K and, for int8, accumulates
+// in i32. Its metadata layout gives a thread two adjacent columns of one row.
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [16, 8]}>
+#linear = #ttg.linear<{register = [[0, 1]], lane = [[8, 0], [0, 2], [1, 0], [2, 0], [4, 0]], warp = [], block = []}>
+module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_mmav2_i8
+  tt.func @sparse_dot_mmav2_i8(%a: tensor<16x32xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>,
+                               %b: tensor<64x8xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>,
+                               %meta: tensor<16x4xi16, #linear>) {
+    %cst = arith.constant dense<0> : tensor<16x8xi32, #mma>
+    // CHECK: mma.sp.sync.aligned.m16n8k64.row.col.satfinite.s32.s8.s8.s32
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<16x32xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> meta tensor<16x4xi16, #linear> * tensor<64x8xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<16x8xi32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// fp8 shares the 8-bit instruction and metadata layout, with an f32
+// accumulator. ptxas only accepts these on sm_89 and later.
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [16, 8]}>
+#linear = #ttg.linear<{register = [[0, 1]], lane = [[8, 0], [0, 2], [1, 0], [2, 0], [4, 0]], warp = [], block = []}>
+module attributes {"ttg.target" = "cuda:89", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_mmav2_fp8
+  tt.func @sparse_dot_mmav2_fp8(%a: tensor<16x32xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>,
+                                %b: tensor<64x8xf8E5M2, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>,
+                                %meta: tensor<16x4xi16, #linear>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<16x8xf32, #mma>
+    // CHECK: mma.sp.sync.aligned.m16n8k64.row.col.f32.e4m3.e5m2.f32
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<16x32xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> meta tensor<16x4xi16, #linear> * tensor<64x8xf8E5M2, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<16x8xf32, #mma>
+    tt.return
+  }
+}

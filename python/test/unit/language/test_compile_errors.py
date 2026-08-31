@@ -704,7 +704,7 @@ def test_dot_sparse_min_size(fresh_triton_cache):
 
 
 def test_dot_sparse_acc_type_mismatch(fresh_triton_cache):
-    """acc must match the return type (fp32, same M/N shape)."""
+    """acc must match the requested out_dtype."""
 
     @triton.jit
     def kernel():
@@ -714,11 +714,45 @@ def test_dot_sparse_acc_type_mismatch(fresh_triton_cache):
         a = tl.full((M, K // 2), 0.0, tl.float16)
         b = tl.full((K, N), 0.0, tl.float16)
         meta = tl.full((M, K // 16), 0, tl.int16)
-        # acc shape (M, N) is correct but dtype fp16 != expected fp32
+        # out_dtype asks for an fp32 accumulator but acc is fp16
         acc = tl.full((M, N), 0.0, tl.float16)
-        tl.dot_sparse(a, b, meta, acc=acc)
+        tl.dot_sparse(a, b, meta, acc=acc, out_dtype=tl.float32)
 
     with pytest.raises(CompilationError):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_f16_acc_needs_f16_inputs(fresh_triton_cache):
+    """mma.sp only has an fp16 accumulator for fp16 inputs."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.bfloat16)
+        b = tl.full((K, N), 0.0, tl.bfloat16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta, out_dtype=tl.float16)
+
+    with pytest.raises(CompilationError, match="requires float16 inputs"):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
+
+
+def test_dot_sparse_out_dtype_unsupported(fresh_triton_cache):
+    """Only float32 and float16 accumulators exist."""
+
+    @triton.jit
+    def kernel():
+        M: tl.constexpr = 32
+        K: tl.constexpr = 64
+        N: tl.constexpr = 32
+        a = tl.full((M, K // 2), 0.0, tl.float16)
+        b = tl.full((K, N), 0.0, tl.float16)
+        meta = tl.full((M, K // 16), 0, tl.int16)
+        tl.dot_sparse(a, b, meta, out_dtype=tl.bfloat16)
+
+    with pytest.raises(CompilationError, match="Use float32 or float16"):
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
 
 
