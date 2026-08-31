@@ -889,7 +889,8 @@ void init_gluon_ir(py::module_ &m) {
               triton::InputPrecision precision = triton::InputPrecision::IEEE,
               int maxNumImpreciseAcc = 0, bool isAsync = false) -> Value {
              return self.create<ttng::WarpGroupDotOp>(
-                 a, b, acc, useAcc, precision, maxNumImpreciseAcc, isAsync);
+                 a, b, acc, useAcc, /*aMeta=*/Value(), precision,
+                 maxNumImpreciseAcc, isAsync);
            })
       .def("create_warpgroup_mma_wait",
            [](GluonOpBuilder &self, std::vector<Value> &deps, int pendings) {

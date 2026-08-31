@@ -28,9 +28,16 @@ class SwizzledSharedEncodingAttr;
 // Version = 1: <m, n>
 // Version = 2: <1, m, n>
 // Version = 3: <m, n, k>
+//
+// `isSparse` selects the 2:4 structured-sparse instruction, whose K is twice
+// the dense one for the same operand width (wgmma.mma_async.sp.m64nNk32 for
+// 16-bit operands, .m64nNk64 for 8-bit ones). It only affects version 3;
+// version 2 does not carry K in its instruction shape, and MMAv5's sparse
+// shape is picked separately.
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
-                                                Type type, int numWarps);
+                                                Type type, int numWarps,
+                                                bool isSparse = false);
 
 // Gets the order of a tensor from its contiguity. Places the dimensions with
 // the largest contiguity as the inner most dimension. If the contiguity is

@@ -30,7 +30,8 @@ using namespace triton;
 
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
-                                                Type eltType, int numWarps) {
+                                                Type eltType, int numWarps,
+                                                bool isSparse) {
   if (version == 1)
     return {16, 16};
   else if (version == 2) {
@@ -40,7 +41,10 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     ret[rank - 2] = eltType.isF64() ? 8 : 16;
     return ret;
   } else if (version == 3) {
-    unsigned k = 256 / eltType.getIntOrFloatBitWidth();
+    // wgmma.mma_async covers 256 bits of K per operand element position; the
+    // sparse form reads twice as many dense K values from the same operand
+    // bits, so its instruction K doubles (k32 for 16-bit, k64 for 8-bit).
+    unsigned k = (isSparse ? 512 : 256) / eltType.getIntOrFloatBitWidth();
     if (shape[0] % 64 != 0 || shape[1] % 8 != 0) {
       assert(false && "type not supported");
       return {0, 0, 0};

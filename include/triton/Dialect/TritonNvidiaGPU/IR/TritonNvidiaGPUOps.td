@@ -226,15 +226,23 @@ def TTNG_CLCGetProgramIdOp : TTNG_Op<"clc_get_program_id", [Pure]> {
 // WarpGroupDot Op
 //
 def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [
+  AttrSizedOperandSegments,
   DeclareOpInterfaceMethods<InferTypeOpInterface>,
   DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-  DeclareOpInterfaceMethods<DotOpInterface>,
+  DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims"]>,
   TypesMatchWith<"result's type matches accumulator's type", "d", "c", "$_self">
 ]> {
   let summary = "warp group dot";
 
   let description = [{
     $d = matrix_multiply($a, $b) + $c. For docs on InputPrecisionAttr, see TT_DotOp
+
+    When the optional $aMeta operand is present, $a is 2:4 structured sparse and
+    this lowers to `wgmma.mma_async.sp` instead of `wgmma.mma_async`. $a then
+    holds only the kept elements, so its K dimension is half of the logical
+    (dense) K, which is the K dimension of $b. $aMeta carries the same i16
+    metadata as `tt.dot_sparse` -- see that op for the format -- laid out with
+    the linear encoding from `getSparseMetadataLayout`.
   }];
 
   let arguments = (ins
@@ -242,6 +250,7 @@ def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [
     TTG_MemDescType:$b,
     TT_FpIntTensor:$c,
     Optional<I1>:$useC,
+    Optional<TT_IntTensor>:$aMeta,
     DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
     DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc,
     DefaultValuedAttr<BoolAttr, "false">:$isAsync
@@ -250,12 +259,13 @@ def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [
   let results = (outs TT_FpIntTensor:$d);
 
   let assemblyFormat = [{
-    $a`,` $b`,` $c (`,` $useC^)? attr-dict
-    `:` type($a) `*` qualified(type($b)) `->` type($d)
+    $a (`meta` $aMeta^)? `,` $b`,` $c (`,` $useC^)? attr-dict
+    `:` type($a) (`meta` type($aMeta)^)? `*` qualified(type($b)) `->` type($d)
   }];
 
   let extraClassDeclaration = [{
     bool needsPartialAccumulator();
+    bool isSparse() { return getAMeta() != nullptr; }
   }];
 
   let hasVerifier = 1;

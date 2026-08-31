@@ -442,7 +442,8 @@ struct MMAEncodingResult {
 static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
                                                  PatternRewriter &rewriter,
                                                  int computeCapability,
-                                                 int versionMajor) {
+                                                 int versionMajor,
+                                                 bool isSparse = false) {
   auto oldRetType = cast<RankedTensorType>(dotOp.getD().getType());
   auto oldAType = cast<RankedTensorType>(dotOp.getA().getType());
 
@@ -456,8 +457,9 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
 
   auto CGALayout = getCGALayout(oldRetType.getEncoding());
   auto retShapePerCTA = getShapePerCTA(oldRetType);
-  auto instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,
-                                           oldAType.getElementType(), numWarps);
+  auto instrShape =
+      mmaVersionToInstrShape(versionMajor, retShapePerCTA,
+                             oldAType.getElementType(), numWarps, isSparse);
   auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
                                       numWarps, instrShape);
 
@@ -556,8 +558,8 @@ public:
 
       newDot = triton::nvidia_gpu::WarpGroupDotOp::create(
           rewriter, dotOp.getLoc(), mmaResult.newRetType, a, b,
-          mmaResult.newAcc, nullptr, dotOp.getInputPrecision(),
-          dotOp.getMaxNumImpreciseAcc(), false);
+          mmaResult.newAcc, /*useC=*/nullptr, /*aMeta=*/nullptr,
+          dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(), false);
     } else {
       int minBitwidth =
           std::min(computeOrigBitWidth(a), computeOrigBitWidth(b));
@@ -585,28 +587,76 @@ public:
       : OpRewritePattern<DotSparseOp>(context, benefit),
         computeCapability(computeCapability) {}
 
+  // Highest sparse MMA version usable for this target and dot, or 0 to leave
+  // the op alone. MMAv2 (mma.sp.sync) is what sm_80-sm_89 and consumer
+  // Blackwell (sm_120+) have: neither has TMEM, so neither has tcgen05.mma.sp,
+  // which is the same reason getMMAVersionSafe picks MMAv2 there for the dense
+  // dot. Hopper prefers MMAv3 (wgmma.mma_async.sp) and falls back to MMAv2 for
+  // shapes wgmma cannot express, mirroring getMMAVersionSafe's {3, 2} for the
+  // dense dot -- there is no dense path to fall back to here, so a slower
+  // instruction beats failing to lower. Datacenter Blackwell's tcgen05.mma.sp
+  // is not implemented yet, and falling back to a lower version there would be
+  // slower than the dense dot it uses, so reject.
+  static int getSparseMMAVersion(int computeCapability, DotSparseOp dotOp) {
+    if (computeCapability >= 80 && computeCapability < 90)
+      return 2;
+    if (computeCapability >= 120 && computeCapability < 130)
+      return 2;
+    if (computeCapability >= 90 && computeCapability < 100) {
+      if (supportSparseWGMMA(dotOp))
+        return 3;
+      auto remark = dotOp.emitRemark()
+                    << "sparse MMA version 3 acceleration not applied due to "
+                       "unsupported shapes or data types.";
+      remark.attachNote() << "Target compute capability (" << computeCapability
+                          << ") supports sparse MMA v3.";
+      return 2;
+    }
+    return 0;
+  }
+
+  // Shape and warp constraints of wgmma.mma_async.sp, checked before committing
+  // to MMAv3 so that an unsupported shape keeps the op intact rather than
+  // producing an invalid WarpGroupDotOp.
+  static bool supportSparseWGMMA(DotSparseOp dotOp) {
+    auto retType = cast<RankedTensorType>(dotOp.getType());
+    auto retShapePerCTA = getShapePerCTA(retType);
+    if (retShapePerCTA.size() != 2)
+      return false;
+    // A warpgroup computes m64, and each of its four warps supplies the
+    // metadata for 16 of those rows.
+    if (retShapePerCTA[0] % 64 != 0 || retShapePerCTA[1] % 8 != 0)
+      return false;
+    if (lookupNumWarps(dotOp) % 4 != 0)
+      return false;
+    auto aTy = cast<RankedTensorType>(dotOp.getA().getType());
+    unsigned bitwidth = aTy.getElementTypeBitWidth();
+    if (bitwidth != 16 && bitwidth != 8)
+      return false;
+    // One instruction consumes instrK dense K values, i.e. instrK / 2 columns
+    // of the packed lhs, so the packed K must cover a whole number of them.
+    unsigned instrKDense = 512 / bitwidth;
+    return aTy.getShape()[1] % (instrKDense / 2) == 0;
+  }
+
   mlir::LogicalResult
   matchAndRewrite(triton::DotSparseOp dotOp,
                   mlir::PatternRewriter &rewriter) const override {
-    // Sparse MMA only exists as MMAv2 (mma.sp.sync) here, which is selected on
-    // sm_80-sm_89 and again on consumer Blackwell (sm_120+), which has no TMEM
-    // and therefore no tcgen05.mma.sp -- the same reason getMMAVersionSafe
-    // picks MMAv2 there for the dense dot. Hopper and datacenter Blackwell have
-    // wgmma.sp / tcgen05.mma.sp instead; until those are implemented, leave the
-    // op alone rather than falling back to MMAv2, which would be slower there
-    // than the dense path.
-    if (!((computeCapability >= 80 && computeCapability < 90) ||
-          (computeCapability >= 120 && computeCapability < 130)))
-      return failure();
-
+    // Bail on an already-converted op before picking a version, so the "v3 not
+    // applied" remark is emitted once rather than again on the op this pattern
+    // just produced.
     auto retType = cast<RankedTensorType>(dotOp.getType());
     if (!retType.getEncoding() ||
         mlir::isa<NvidiaMmaEncodingAttr>(retType.getEncoding()))
       return failure();
 
-    int versionMajor = 2;
-    auto mmaResult = createMMAEncodingForDot(dotOp, rewriter,
-                                             computeCapability, versionMajor);
+    int versionMajor = getSparseMMAVersion(computeCapability, dotOp);
+    if (versionMajor == 0)
+      return failure();
+
+    auto mmaResult =
+        createMMAEncodingForDot(dotOp, rewriter, computeCapability,
+                                versionMajor, /*isSparse=*/true);
     if (!mmaResult.mmaEnc)
       return failure();
 
@@ -625,19 +675,18 @@ public:
     auto bEltBits =
         cast<RankedTensorType>(b.getType()).getElementTypeBitWidth();
     int minBitwidth = std::min<int>(aEltBits, bEltBits);
-    a = convertDotOperandForMMA(a, 0, minBitwidth, mmaResult.newRetType,
-                                rewriter);
-    b = convertDotOperandForMMA(b, 1, minBitwidth, mmaResult.newRetType,
-                                rewriter);
-    // Convert aMeta to the mma.sp metadata layout. It duplicates across the
-    // parent MMA's N-warps, which LinearEncodingAttr expresses as broadcast
-    // bases, so no dedicated encoding attribute is needed.
+
+    // Convert aMeta to the mma.sp / wgmma.mma_async.sp metadata layout. It
+    // duplicates across the parent MMA's N-warps, which LinearEncodingAttr
+    // expresses as broadcast bases, so no dedicated encoding attribute is
+    // needed.
     {
       auto metaTy = cast<RankedTensorType>(aMeta.getType());
       MLIRContext *ctx = rewriter.getContext();
       auto ll = triton::gpu::getSparseMetadataLayout(
           ctx, metaTy.getShape(), mmaResult.mmaEnc.getWarpsPerCTA(),
-          mmaResult.mmaEnc.getCGALayout(), static_cast<unsigned>(minBitwidth));
+          mmaResult.mmaEnc.getCGALayout(), static_cast<unsigned>(minBitwidth),
+          /*rowMajorWarpOrder=*/!mmaResult.mmaEnc.isHopper());
       auto metaEncoding =
           triton::gpu::LinearEncodingAttr::get(ctx, std::move(ll));
       auto newMetaTy = metaTy.cloneWithEncoding(metaEncoding);
@@ -645,9 +694,39 @@ public:
                                       aMeta);
     }
 
-    auto newDot = DotSparseOp::create(
-        rewriter, dotOp.getLoc(), mmaResult.newRetType,
-        a, b, mmaResult.newAcc, aMeta);
+    Operation *newDot = nullptr;
+    if (versionMajor == 3) {
+      // wgmma reads both multiplicands from shared memory. The sparse lhs stays
+      // in shared memory even when it comes from registers: the register-lhs
+      // form of wgmma.mma_async.sp exists, but the in-register pipelining that
+      // motivates it (splitRSDot) would have to split the metadata operand
+      // along K as well.
+      auto eltType = cast<RankedTensorType>(a.getType()).getElementType();
+      bool allowTranspose = eltType.isF16() || eltType.isBF16();
+      a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose,
+                                    /*isMMAv5Fp4Padded=*/false,
+                                    /*forceTranspose=*/false, dotOp);
+      b = getSharedMemoryMMAOperand(b, rewriter, 1, allowTranspose,
+                                    /*isMMAv5Fp4Padded=*/false,
+                                    /*forceTranspose=*/false, dotOp);
+      // tt.dot_sparse carries no max_num_imprecise_acc (the op is shared with
+      // the AMD backend, which has no such knob), so use what this backend
+      // defaults to for a dense fp8 dot on sm_90: accumulate natively, i.e. a
+      // bound no K can reach. Anything below 32 is rejected outright for an
+      // fp8 operand with an f32 accumulator.
+      newDot = triton::nvidia_gpu::WarpGroupDotOp::create(
+          rewriter, dotOp.getLoc(), mmaResult.newRetType, a, b,
+          mmaResult.newAcc, /*useC=*/nullptr, aMeta, InputPrecision::IEEE,
+          /*maxNumImpreciseAcc=*/1 << 30, /*isAsync=*/false);
+    } else {
+      a = convertDotOperandForMMA(a, 0, minBitwidth, mmaResult.newRetType,
+                                  rewriter);
+      b = convertDotOperandForMMA(b, 1, minBitwidth, mmaResult.newRetType,
+                                  rewriter);
+      newDot = DotSparseOp::create(rewriter, dotOp.getLoc(),
+                                   mmaResult.newRetType, a, b,
+                                   mmaResult.newAcc, aMeta);
+    }
     rewriter.replaceOpWithNewOp<ConvertLayoutOp>(dotOp, dotOp.getType(),
                                                  newDot->getResult(0));
     return success();

@@ -3321,6 +3321,33 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+// On Hopper the sparse dot lowers to nvg.wgmma with a metadata operand, which
+// convert-nv-gpu-to-llvm turns into wgmma.mma_async.sp (checked in
+// nvgpu_to_llvm.mlir). The instruction shape's K is the dense K, so the lhs
+// tile is half as wide as the rhs tile is tall, and the two i16 metadata
+// elements a thread holds per instruction are packed into one i32.
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 32]}>
+#linear = #ttg.linear<{register = [[8, 0]], lane = [[0, 1], [0, 0], [1, 0], [2, 0], [4, 0]], warp = [[16, 0], [32, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_mmav3
+  tt.func @sparse_dot_mmav3(%a: !ttg.memdesc<64x16xf16, #shared, #smem>,
+                            %b: !ttg.memdesc<32x64xf16, #shared1, #smem>,
+                            %meta: tensor<64x2xi16, #linear>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
+    // CHECK: llvm.shl
+    // CHECK: llvm.or
+    // CHECK: wgmma.fence.aligned
+    // CHECK: nvg.wgmma {{.*}} meta {{.*}} k = 32
+    %0 = ttng.warp_group_dot %a meta %meta, %b, %cst : !ttg.memdesc<64x16xf16, #shared, #smem> meta tensor<64x2xi16, #linear> * !ttg.memdesc<32x64xf16, #shared1, #smem> -> tensor<64x64xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
 // fp8 shares the 8-bit instruction and metadata layout, with an f32
 // accumulator. ptxas only accepts these on sm_89 and later.
 #mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [16, 8]}>

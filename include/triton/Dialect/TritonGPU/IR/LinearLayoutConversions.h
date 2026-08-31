@@ -154,15 +154,23 @@ LinearLayout getSM120DotScaledScaleLayout(MLIRContext *ctx,
                                           CGAEncodingAttr cgaLayout);
 
 // Layout of the metadata operand of `tt.dot_sparse`, matching the
-// thread-to-metadata mapping of `mma.sp.sync.aligned` with selector 0.
+// thread-to-metadata mapping of `mma.sp.sync.aligned` (MMAv2) and
+// `wgmma.mma_async.sp.sync.aligned` (MMAv3) with selector 0.  The PTX ISA
+// documents both with the same figures, so the per-warp mapping is shared and
+// only the warp bases differ.
+//
 // `elemBitWidth` is the bit width of the sparse operands and picks the
-// instruction: 16 bits use m16n8k32, 8 bits use m16n8k64.  The metadata is
-// replicated across the parent MMA's N-warps, which this layout expresses
-// with broadcast (zero) bases.
+// instruction: 16 bits use m16n8k32 / m64nNk32, 8 bits use m16n8k64 /
+// m64nNk64.  `rowMajorWarpOrder` must match the parent MMA's warp order --
+// `getMatrixOrder(rank, rowMajor)`, i.e. true for Ampere (warp bit 0 walks N)
+// and false for Hopper (warp bit 0 walks M, since a warpgroup stacks its four
+// warps along M).  The metadata is replicated across the parent MMA's N-warps,
+// which this layout expresses with broadcast (zero) bases.
 LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
                                      ArrayRef<unsigned> warpsPerCTA,
                                      CGAEncodingAttr cgaLayout,
-                                     unsigned elemBitWidth);
+                                     unsigned elemBitWidth,
+                                     bool rowMajorWarpOrder = true);
 
 // Create LinearLayout for nvidia mma tile.
 LinearLayout nvidiaMmaTile(MLIRContext *ctx, ArrayRef<unsigned> tileShape,

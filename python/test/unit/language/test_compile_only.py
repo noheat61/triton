@@ -407,3 +407,64 @@ def test_fp8_compiles_for_multiple_architectures_cuda():
     src = ASTSource(fn=fp8_convert, signature={"src": "*fp32", "dst": "*fp8e5"}, constexprs={})
     triton.compile(src, target=GPUTarget("cuda", 90, 32))
     triton.compile(src, target=GPUTarget("cuda", 80, 32))
+
+
+# ---- tl.dot_sparse: which sparse instruction each target selects ----
+#
+# These compile for a target rather than the local device, so they cover the
+# architectures the sparse dot supports without needing one of each GPU. Only
+# the instruction selection is checked here; the numerics live in test_core.py
+# and need real hardware.
+
+
+@triton.jit
+def _sparse_matmul_kernel(a_ptr, b_ptr, c_ptr, meta_ptr, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                          BLOCK_K: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    a_ptrs = a_ptr + offs_m[:, None] * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)[None, :]
+    b_ptrs = b_ptr + tl.arange(0, BLOCK_K)[:, None] * BLOCK_N + offs_n[None, :]
+    m_ptrs = meta_ptr + offs_m[:, None] * (BLOCK_K // 16) + tl.arange(0, BLOCK_K // 16)[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        acc = tl.dot_sparse(tl.load(a_ptrs), tl.load(b_ptrs), tl.load(m_ptrs), acc)
+        a_ptrs += BLOCK_K // 2
+        b_ptrs += BLOCK_K * BLOCK_N
+        m_ptrs += BLOCK_K // 16
+    tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], acc)
+
+
+def _compile_sparse_matmul(capability, dtype, block_k):
+    src = ASTSource(
+        fn=_sparse_matmul_kernel, signature={
+            "a_ptr": dtype, "b_ptr": dtype, "c_ptr": "*fp32", "meta_ptr": "*i16", "K": "i32",
+            "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"
+        }, constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": block_k})
+    return triton.compile(src, target=GPUTarget("cuda", capability, 32), options={"num_warps": 4})
+
+
+@pytest.mark.parametrize("capability", [80, 86, 120])
+def test_compile_only_dot_sparse_mmav2(capability) -> None:
+    """sm_80-sm_89 and consumer Blackwell both use mma.sp.sync (MMAv2)."""
+    ptx = _compile_sparse_matmul(capability, "*fp16", 64).asm["ptx"]
+    assert "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32" in ptx
+    assert "wgmma" not in ptx
+
+
+def test_compile_only_dot_sparse_mmav3() -> None:
+    """Hopper uses wgmma.mma_async.sp, whose K is the dense K."""
+    ptx = _compile_sparse_matmul(90, "*fp16", 64).asm["ptx"]
+    assert re.search(r"wgmma\.mma_async\.sp\.sync\.aligned\.m64n\d+k32\.f32\.f16\.f16", ptx)
+    assert "mma.sp.sync" not in ptx
+
+
+def test_compile_only_dot_sparse_mmav3_8bit() -> None:
+    """The 8-bit Hopper shape is m64nNk64 for both fp8 and int8."""
+    ptx = _compile_sparse_matmul(90, "*fp8e4nv", 128).asm["ptx"]
+    assert re.search(r"wgmma\.mma_async\.sp\.sync\.aligned\.m64n\d+k64\.f32\.e4m3\.e4m3", ptx)
+
+
+def test_compile_only_dot_sparse_unsupported_target() -> None:
+    """Datacenter Blackwell has tcgen05.mma.sp, which is not implemented yet."""
+    with pytest.raises(triton.CompilationError, match="Unsupported lhs dtype fp16 for dot_sparse on this target"):
+        _compile_sparse_matmul(100, "*fp16", 64)

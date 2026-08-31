@@ -206,6 +206,14 @@ unsigned getBitwidth(RankedTensorType ty);
 std::optional<ConstantIntRanges> getBoundFromCmpOp(arith::CmpIOp cmpOp,
                                                    Value anchor);
 
+// Verify the 2:4 sparsity metadata operand of a sparse dot against the sparse
+// lhs it describes. `DotOpInterface`'s verifier covers $a/$b/$c but never looks
+// at the metadata, so every sparse dot op calls this from its own verifier.
+// `aShape` is the shape of the sparse (packed) lhs, holding only the kept
+// elements.
+LogicalResult verifySparseDotMetadata(Operation *op, ArrayRef<int64_t> aShape,
+                                      ShapedType metaTy);
+
 } // namespace triton
 } // namespace mlir
 

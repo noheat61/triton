@@ -395,6 +395,11 @@ public:
     if (op.getOpC())
       operandsAndConstraints.push_back({opScaleD, "b"});
 
+    // `sp-meta`. It is listed last here but appears before `scale-d` in the
+    // instruction; getPtxAsm places the operand indices accordingly.
+    if (auto spMeta = op.getSpMeta())
+      operandsAndConstraints.push_back({spMeta, "r"});
+
     return operandsAndConstraints;
   }
 
@@ -410,6 +415,7 @@ public:
     auto eltTypeB = op.getEltTypeB();
     auto layoutA = op.getLayoutA();
     auto layoutB = op.getLayoutB();
+    bool isSparse = op.getSpMeta() != nullptr;
 
     // Register checks
     auto typeA = opA.getType();
@@ -428,15 +434,18 @@ public:
     bool transB = layoutB == WGMMALayout::row;
     bool supported = false, needTransArgs = false, floatTypeWGMMA = false;
     assert(m % 8 == 0 && n % 8 == 0 && k % 8 == 0);
+    // The sparse form reads twice as many dense K values out of the same
+    // operand bits, so every K below doubles for wgmma.mma_async.sp.
+    unsigned kScale = isSparse ? 2 : 1;
     // Below instructions do support transposing, must pass `trans` arguments
     supported |=
         (eltTypeA == WGMMAEltType::f16) && (eltTypeB == WGMMAEltType::f16) &&
         (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
-        (m == 64 && 8 <= n && n <= 256 && k == 16);
+        (m == 64 && 8 <= n && n <= 256 && k == 16 * kScale);
     supported |= (eltTypeA == WGMMAEltType::bf16) &&
                  (eltTypeB == WGMMAEltType::bf16) &&
                  (eltTypeC == WGMMAEltType::f32) &&
-                 (m == 64 && 8 <= n && n <= 256 && k == 16);
+                 (m == 64 && 8 <= n && n <= 256 && k == 16 * kScale);
     needTransArgs = supported;
     floatTypeWGMMA = supported;
     // Below instructions do not support transposing
@@ -444,18 +453,18 @@ public:
       supported |= (eltTypeA == WGMMAEltType::tf32) &&
                    (eltTypeB == WGMMAEltType::tf32) &&
                    (eltTypeC == WGMMAEltType::f32) &&
-                   (m == 64 && 8 <= n && n <= 256 && k == 8);
+                   (m == 64 && 8 <= n && n <= 256 && k == 8 * kScale);
       supported |=
           (eltTypeA == WGMMAEltType::e4m3 || eltTypeA == WGMMAEltType::e5m2) &&
           (eltTypeB == WGMMAEltType::e4m3 || eltTypeB == WGMMAEltType::e5m2) &&
           (eltTypeC == WGMMAEltType::f16 || eltTypeC == WGMMAEltType::f32) &&
-          (m == 64 && 8 <= n && n <= 256 && k == 32);
+          (m == 64 && 8 <= n && n <= 256 && k == 32 * kScale);
       floatTypeWGMMA = supported;
       // Below instructions are integer-based
       supported |= (eltTypeA == WGMMAEltType::s8) &&
                    (eltTypeB == WGMMAEltType::s8) &&
                    (eltTypeC == WGMMAEltType::s32) &&
-                   (m == 64 && 8 <= n && n <= 224 && k == 32);
+                   (m == 64 && 8 <= n && n <= 224 && k == 32 * kScale);
     }
     assert(supported && "WGMMA type or shape is not supported");
 
@@ -491,11 +500,21 @@ public:
     // Operand B (must be `desc`)
     args += "$" + std::to_string(asmOpIdx++) + ", ";
 
-    // `scale-d`
+    // `scale-d` and `sp-meta` come from getOperandsAndConstraints in that
+    // order, but the instruction spells sp-meta and sp-sel out first.
+    std::string scaleD = "0";
     if (op.getOpC())
-      args += "$" + std::to_string(asmOpIdx++);
-    else
-      args += "0";
+      scaleD = "$" + std::to_string(asmOpIdx++);
+
+    if (isSparse) {
+      // `sp-meta`, then `sp-sel`. The selector picks which thread pair of each
+      // quad supplies the quad's metadata for the 16-bit shapes, and must be 0
+      // for the 8-bit ones (every thread supplies its own). getSparseMetadataLayout
+      // gives each thread the metadata for its own rows, so 0 is right for both.
+      args += "$" + std::to_string(asmOpIdx++) + ", 0, ";
+    }
+
+    args += scaleD;
 
     // `imm-scale-a`, and `imm-scale-b` are 1 by default only for float-based
     // WGMMA
@@ -509,7 +528,8 @@ public:
       args += ", " + std::to_string(transB);
     }
 
-    auto ptxAsm = "wgmma.mma_async.sync.aligned"
+    auto ptxAsm = std::string("wgmma.mma_async") + (isSparse ? ".sp" : "") +
+                  ".sync.aligned"
                   ".m" +
                   std::to_string(m) + "n" + std::to_string(n) + "k" +
                   std::to_string(k) + "." + stringifyEnum(eltTypeC).str() +

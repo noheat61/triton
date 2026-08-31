@@ -182,12 +182,41 @@ SmallVector<Value> emitWait(ConversionPatternRewriter &rewriter, Location loc,
   return results;
 }
 
+// Assemble the 32-bit sparsity metadata operand each thread feeds to
+// wgmma.mma_async.sp, one per (m, k) instruction position.
+//
+// getSparseMetadataLayout hands every thread two i16 metadata elements per
+// instruction, whose register bases are ordered (pair, k-groups..., m-reps...).
+// The flat index of an element is therefore pair + 2 * (k + numRepK * m), and
+// the 32-bit operand is the low element in bits 15:0 and the high one in bits
+// 31:16 -- for the 16-bit shapes those are rows r and r + 8 of one metadata
+// column, for the 8-bit ones two adjacent columns of one row. Either way the
+// packing is the same, which is why this does not need to know which it is.
+static SmallVector<Value> buildSparseMetaRegs(TritonLLVMOpBuilder &tb,
+                                              const SmallVector<Value> &elems,
+                                              int numRepM, int numRepK,
+                                              Type i32Ty) {
+  SmallVector<Value> metaRegs(numRepM * numRepK);
+  int numElems = static_cast<int>(elems.size());
+  for (int m = 0; m < numRepM; ++m) {
+    for (int k = 0; k < numRepK; ++k) {
+      int flat = m * numRepK + k;
+      int idx0 = flat * 2;
+      int idx1 = flat * 2 + 1;
+      Value lo = idx0 < numElems ? tb.zext(i32Ty, elems[idx0]) : tb.i32_val(0);
+      Value hi = idx1 < numElems ? tb.zext(i32Ty, elems[idx1]) : tb.i32_val(0);
+      metaRegs[flat] = tb.or_(lo, tb.shl(hi, tb.i32_val(16)));
+    }
+  }
+  return metaRegs;
+}
+
 LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
                          ConversionPatternRewriter &rewriter, Location loc,
                          Operation *op, Value a, Value b, Value c, Value d,
-                         Value useCOperand, Value loadedA, Value loadedB,
-                         Value loadedC, bool allowTF32,
-                         bool needsPartialAccumulator,
+                         Value useCOperand, Value aMeta, Value loadedA,
+                         Value loadedB, Value loadedC, Value loadedAMeta,
+                         bool allowTF32, bool needsPartialAccumulator,
                          uint32_t maxNumImpreciseAcc, bool sync, Value thread) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
   auto aTensorTy = cast<triton::gpu::TensorOrMemDesc>(a.getType());
@@ -216,21 +245,26 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   unsigned mmaSizeM = shapePerCTATile[0];
   unsigned mmaSizeN = shapePerCTATile[1];
   unsigned mmaSizeK = instrMNK[2];
+  // instrMNK[2] is the instruction's K, i.e. the dense K. The sparse lhs holds
+  // half of it, so its tile and its K step are half as wide; operand B and the
+  // imprecise-accumulation count stay on the dense K.
+  bool isSparse = aMeta != nullptr;
+  unsigned mmaSizeKA = isSparse ? mmaSizeK / 2 : mmaSizeK;
   int numRepM = ceil<unsigned>(dShapePerCTA[0], mmaSizeM);
   int numRepN = ceil<unsigned>(dShapePerCTA[1], mmaSizeN);
-  int numRepK = ceil<unsigned>(aTensorTy.getShape()[1], mmaSizeK);
+  int numRepK = ceil<unsigned>(aTensorTy.getShape()[1], mmaSizeKA);
   DotOpMmaSmemLoader aLoader;
   SmallVector<Value> structA;
   bool transA = false;
   if (aInShared) {
-    auto loader =
-        DotOpMmaSmemLoader::build(loc, rewriter, cast<MemDescType>(aTensorTy),
-                                  baseA, {M, K}, 0, 3, false, dTensorTy);
+    auto loader = DotOpMmaSmemLoader::build(
+        loc, rewriter, cast<MemDescType>(aTensorTy), baseA, {M, mmaSizeKA}, 0,
+        3, false, dTensorTy);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid wgmma layout for "
                                   "operand A in shared memory ")
-             << aTensorTy << " for WGMMA instruction shape [" << M << ", " << K
-             << "]";
+             << aTensorTy << " for WGMMA instruction shape [" << M << ", "
+             << mmaSizeKA << "]";
     }
     aLoader = std::move(*loader);
     transA = aLoader.getDescriptor().transposed;
@@ -248,6 +282,17 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   bool transB = !bLoader->getDescriptor().transposed;
 
   auto fc = unpackTensorElements(loc, loadedC, rewriter, dTensorTy);
+
+  // Built before the wgmma.fence below, like the register A operands: sp-meta
+  // is a register read of the async instruction, so PTX requires it to be
+  // fenced from its prior writes.
+  SmallVector<Value> metaRegs;
+  if (isSparse) {
+    auto metaElems = unpackTensorElements(loc, loadedAMeta, rewriter,
+                                          aMeta.getType());
+    metaRegs = buildSparseMetaRegs(tb, metaElems, numRepM, numRepK,
+                                   rewriter.getI32Type());
+  }
 
   triton::nvgpu::WGMMAEltType eltTypeC = getMmaRetType(d);
   triton::nvgpu::WGMMAEltType eltTypeA = getMmaOperandType(a, allowTF32);
@@ -283,7 +328,7 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
       for (int k = 0; k < numRepK; ++k) {
         Value a;
         if (aInShared) {
-          a = aLoader.smemLoad(m * mmaSizeM, k * mmaSizeK, rewriter, loc);
+          a = aLoader.smemLoad(m * mmaSizeM, k * mmaSizeKA, rewriter, loc);
         } else {
           auto aDotOpEnc =
               cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
@@ -335,8 +380,9 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
             needsPartialAccumulator &&
             (numLowPrecisionAcc >= maxNumImpreciseAcc || k == numRepK - 1);
         Value mmaAcc = needsPartialAccumulator ? partialAcc : d;
+        Value spMeta = isSparse ? metaRegs[m * numRepK + k] : Value();
         mmaAcc = triton::nvgpu::WGMMAOp::create(
-            rewriter, loc, accTy, a, b, useC, mmaAcc, M, N, K, eltTypeC,
+            rewriter, loc, accTy, a, b, useC, mmaAcc, spMeta, M, N, K, eltTypeC,
             eltTypeA, eltTypeB, layoutA, layoutB);
         useC = tb.i1_val(1);
         if (needsPartialAccumulator)
@@ -380,7 +426,9 @@ LogicalResult convertWGMMA(triton::nvidia_gpu::WarpGroupDotOp op,
                            ConversionPatternRewriter &rewriter, Value thread) {
   return convertDot(typeConverter, rewriter, op.getLoc(), op.getOperation(),  //
                     op.getA(), op.getB(), op.getC(), op.getD(), op.getUseC(), //
-                    adaptor.getA(), adaptor.getB(), adaptor.getC(),           //
+                    op.getAMeta(),                                           //
+                    adaptor.getA(), adaptor.getB(), adaptor.getC(),
+                    adaptor.getAMeta(), //
                     op.getInputPrecision() == InputPrecision::TF32,
                     op.needsPartialAccumulator(), op.getMaxNumImpreciseAcc(),
                     !op.getIsAsync(), thread);

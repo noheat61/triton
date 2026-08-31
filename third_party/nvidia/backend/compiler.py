@@ -53,22 +53,23 @@ def get_min_sparse_dot_size(target: GPUTarget):
 
 def get_supported_sparse_dot_dtypes(target: GPUTarget):
     capability = target.arch
-    # Sparse dot lowers to `mma.sp.sync` (MMAv2), which this backend selects on
-    # sm_80-sm_89 and again on consumer Blackwell (sm_120+): those parts have no
-    # TMEM, so `tcgen05.mma.sp` is unavailable there and `mma.sp.sync` is the
-    # sparse instruction, exactly as for the dense dot. Hopper and datacenter
-    # Blackwell instead have wgmma.sp / tcgen05.mma.sp; falling back to MMAv2
-    # there would be slower than the dense `tl.dot` those targets use, so
-    # reject until those paths are implemented.
-    if not (80 <= capability < 90 or 120 <= capability < 130):
+    # Sparse dot lowers to `mma.sp.sync` (MMAv2) on sm_80-sm_89 and again on
+    # consumer Blackwell (sm_120+): those parts have no TMEM, so
+    # `tcgen05.mma.sp` is unavailable there and `mma.sp.sync` is the sparse
+    # instruction, exactly as for the dense dot. Hopper uses MMAv3
+    # (`wgmma.mma_async.sp`). Datacenter Blackwell's `tcgen05.mma.sp` is not
+    # implemented yet, and falling back to a lower version there would be
+    # slower than the dense `tl.dot` it uses, so reject.
+    if not (80 <= capability < 100 or 120 <= capability < 130):
         return lambda input_dtype: False
 
     def is_supported(input_dtype):
-        # mma.sp.sync.aligned.m16n8k32
+        # mma.sp.sync.aligned.m16n8k32 / wgmma.mma_async.sp.m64nNk32
         if input_dtype.name in ("fp16", "bf16"):
             return True
-        # mma.sp.sync.aligned.m16n8k64. Triton's IR has signless integers, so
-        # only the signed .s8 variant is reachable, as for the dense int8 dot.
+        # mma.sp.sync.aligned.m16n8k64 / wgmma.mma_async.sp.m64nNk64. Triton's
+        # IR has signless integers, so only the signed .s8 variant is
+        # reachable, as for the dense int8 dot.
         if input_dtype.name == "int8":
             return True
         # The fp8 flavours of m16n8k64 need sm_89 (ptxas rejects them below).

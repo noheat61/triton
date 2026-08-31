@@ -7704,8 +7704,8 @@ def test_dot_sparse(in_dtype, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps, dev
         pytest.skip("NVIDIA backend only")
     capability = torch.cuda.get_device_capability()
     cc = capability[0] * 10 + capability[1]
-    if not (80 <= cc < 90 or 120 <= cc < 130):
-        pytest.skip("sparse dot lowers to mma.sp (MMAv2), used on sm_80-sm_89 and sm_120+")
+    if not (80 <= cc < 100 or 120 <= cc < 130):
+        pytest.skip("sparse dot uses mma.sp on sm_80-sm_89 and sm_120+, wgmma.mma_async.sp on sm_90")
     if in_dtype.startswith("float8") and cc < 89:
         pytest.skip("the fp8 flavours of mma.sp.m16n8k64 need sm_89")
 
@@ -7764,8 +7764,8 @@ def test_dot_sparse_fp16_accumulator(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_war
         pytest.skip("NVIDIA backend only")
     capability = torch.cuda.get_device_capability()
     cc = capability[0] * 10 + capability[1]
-    if not (80 <= cc < 90 or 120 <= cc < 130):
-        pytest.skip("sparse dot lowers to mma.sp (MMAv2), used on sm_80-sm_89 and sm_120+")
+    if not (80 <= cc < 100 or 120 <= cc < 130):
+        pytest.skip("sparse dot uses mma.sp on sm_80-sm_89 and sm_120+, wgmma.mma_async.sp on sm_90")
 
     values = [-2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0]
     a_dense, b_dense = _make_24_operands(M, N, K, values, device)

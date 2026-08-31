@@ -281,6 +281,15 @@ LogicalResult WarpGroupDotOp::inferReturnTypes(
   return success();
 }
 
+// $a holds only the kept elements when sparse, so its K is half of $b's.
+bool WarpGroupDotOp::verifyDims() {
+  auto aShape = cast<TensorOrMemDesc>(getA().getType()).getShape();
+  auto bShape = getB().getType().getShape();
+  auto aK = aShape[aShape.size() - 1];
+  auto bK = bShape[bShape.size() - 2];
+  return isSparse() ? aK * 2 == bK : aK == bK;
+}
+
 LogicalResult WarpGroupDotOp::verify() {
   auto resTy = getD().getType();
   auto nvmmaEnc = dyn_cast<NvidiaMmaEncodingAttr>(resTy.getEncoding());
@@ -329,6 +338,24 @@ LogicalResult WarpGroupDotOp::verify() {
     }
   }
 
+  if (auto aMeta = getAMeta()) {
+    // wgmma.mma_async.sp reads the sparse A tile from shared memory, and the
+    // pipeliner's splitRSDot (which would have to split the metadata too) only
+    // fires on a register LHS, so keep the sparse LHS in shared memory.
+    if (!isa<MemDescType>(getA().getType()))
+      return emitOpError("sparse WGMMA requires the LHS in shared memory");
+    if (failed(verifySparseDotMetadata(
+            getOperation(),
+            cast<TensorOrMemDesc>(getA().getType()).getShape(),
+            aMeta.getType())))
+      return failure();
+    // The lowering assembles one 32-bit metadata operand out of two i16
+    // elements per instruction, which the layout from getSparseMetadataLayout
+    // guarantees.
+    if (!isa<LinearEncodingAttr>(aMeta.getType().getEncoding()))
+      return emitOpError("sparse WGMMA metadata must have a linear layout");
+  }
+
   return success();
 }
 
@@ -353,7 +380,10 @@ bool WarpGroupDotOp::needsPartialAccumulator() {
   bool accFP32 =
       cast<triton::gpu::TensorOrMemDesc>(d.getType()).getElementType().isF32();
   uint32_t maxNumImpreciseAcc = getMaxNumImpreciseAcc();
-  return isFP8 && accFP32 && maxNumImpreciseAcc <= aTensorTy.getShape()[1];
+  // WGMMA.cpp counts imprecise accumulations in dense K, so compare against
+  // the dense K: when sparse, $a only holds half of it.
+  int64_t denseK = aTensorTy.getShape()[1] * (isSparse() ? 2 : 1);
+  return isFP8 && accFP32 && maxNumImpreciseAcc <= denseK;
 }
 
 // -- WarpGroupDotWaitOp --

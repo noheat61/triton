@@ -59,6 +59,36 @@ llvm.func @wgmma(%desc: i64, %in: !struct_64xf32) {
 
 // -----
 
+!struct_64xf32 = !llvm.struct<(
+  f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32,
+  f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32,
+  f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32,
+  f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+)>
+
+// The sparse form takes sp-meta and sp-sel between b-desc and scale-d, and its
+// K is the dense K, twice what the packed A operand holds. sp-sel is 0: the
+// metadata layout Triton builds hands each thread the metadata for its own
+// rows, so the first thread pair of every quad already has it.
+// CHECK-LABEL: @wgmma_sp
+llvm.func @wgmma_sp(%desc: i64, %meta: i32) {
+  // CHECK: wgmma.mma_async.sp.sync.aligned.m64n128k32.f32.f16.f16 {$0,{{.*}},$63}, $64, $65, $66, 0, 0, 1, 1, 0, 0;
+  %false = llvm.mlir.constant(false) : i1
+  %acc = nvg.wgmma %desc, %desc, %false meta %meta {
+    eltTypeA = 4 : i32,
+    eltTypeB = 4 : i32,
+    eltTypeC = 7 : i32,
+    layoutA = 0 : i32,
+    layoutB = 1 : i32,
+    m = 64 : i32,
+    n = 128 : i32,
+    k = 32 : i32
+  } : (i64, i64, i1, i32) -> !struct_64xf32
+  llvm.return
+}
+
+// -----
+
 !struct = !llvm.struct<(f32, f32, i32, i32, f16, f16)>
 
 // CHECK-LABEL: @wgmma_wait

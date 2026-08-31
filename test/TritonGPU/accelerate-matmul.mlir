@@ -1184,9 +1184,9 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
                              %b: tensor<64x128xf16, #blocked>,
                              %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 2}>>
-    // CHECK: ttg.convert_layout {{.*}} -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 2}>>
-    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x4xi16, #[[$LINEAR]]>
+    // CHECK-DAG: ttg.convert_layout {{.*}} -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 2}>>
+    // CHECK-DAG: ttg.convert_layout {{.*}} -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 2}>>
+    // CHECK-DAG: ttg.convert_layout {{.*}} -> tensor<128x4xi16, #[[$LINEAR]]>
     // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xf32, #[[$MMA]]>
     %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf16, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<128x128xf32, #blocked>
     tt.return %0 : tensor<128x128xf32, #blocked>
@@ -1209,9 +1209,9 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
                                 %b: tensor<128x128xi8, #blocked>,
                                 %meta: tensor<128x8xi16, #blocked>) -> tensor<128x128xi32, #blocked> {
     %cst = arith.constant dense<0> : tensor<128x128xi32, #blocked>
-    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x64xi8, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 4}>>
-    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x128xi8, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 4}>>
-    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x8xi16, #[[$LINEAR]]>
+    // CHECK-DAG: ttg.convert_layout {{.*}} -> tensor<128x64xi8, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 4}>>
+    // CHECK-DAG: ttg.convert_layout {{.*}} -> tensor<128x128xi8, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 4}>>
+    // CHECK-DAG: ttg.convert_layout {{.*}} -> tensor<128x8xi16, #[[$LINEAR]]>
     // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xi32, #[[$MMA]]>
     %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x64xi8, #blocked> meta tensor<128x8xi16, #blocked> * tensor<128x128xi8, #blocked> -> tensor<128x128xi32, #blocked>
     tt.return %0 : tensor<128x128xi32, #blocked>
@@ -1220,20 +1220,91 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
-// Sparse dot is not converted on sm_90+: those targets have wgmma.sp /
-// tcgen05.mma.sp, and falling back to MMAv2 there would be slower than the
-// dense path. The op must survive the pass unchanged.
+// Sparse dot is not converted on datacenter Blackwell: sm_100 has
+// tcgen05.mma.sp, and falling back to a lower MMA version there would be
+// slower than the dense path. The op must survive the pass unchanged.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
-module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: sparse_dot_sm90_unsupported
-  tt.func public @sparse_dot_sm90_unsupported(%a: tensor<128x32xf16, #blocked>,
-                                              %b: tensor<64x128xf16, #blocked>,
-                                              %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm100_unsupported
+  tt.func public @sparse_dot_sm100_unsupported(%a: tensor<128x32xf16, #blocked>,
+                                               %b: tensor<64x128xf16, #blocked>,
+                                               %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     // CHECK-NOT: ttg.nvidia_mma
     // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xf32, #blocked>
     %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf16, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<128x128xf32, #blocked>
+    tt.return %0 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// On Hopper the sparse dot becomes an MMAv3 ttng.warp_group_dot with the
+// metadata as an extra register operand: both multiplicands go to shared
+// memory, the instruction shape carries the dense K (32 here, twice the packed
+// K of the lhs), and the metadata's warp bases walk M first because a
+// warpgroup stacks its four warps along M.
+
+// CHECK-DAG: #[[$LINEAR:.+]] = #ttg.linear<{register = {{\[}}[8, 0], [0, 2], [64, 0]], lane = {{\[}}[0, 1], [0, 0], [1, 0], [2, 0], [4, 0]], warp = {{\[}}[16, 0], [32, 0]], block = []}>
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 32]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm90
+  tt.func public @sparse_dot_sm90(%a: tensor<128x32xf16, #blocked>,
+                                  %b: tensor<64x128xf16, #blocked>,
+                                  %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<64x128xf16
+    // CHECK: ttg.local_alloc {{.*}} -> !ttg.memdesc<128x32xf16
+    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x4xi16, #[[$LINEAR]]>
+    // CHECK: ttng.warp_group_dot {{.*}} meta {{.*}} -> tensor<128x128xf32, #[[$MMA]]>
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf16, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<128x128xf32, #blocked>
+    tt.return %0 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// A shape wgmma cannot express (M below the 64 rows a warpgroup computes) falls
+// back to MMAv2 with a remark, mirroring what getMMAVersionSafe does for the
+// dense dot. There is no dense path to fall back to for tt.dot_sparse, so a
+// slower instruction beats failing to lower.
+
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 4], instrShape = [16, 8]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm90_small_m
+  tt.func public @sparse_dot_sm90_small_m(%a: tensor<32x32xf16, #blocked>,
+                                          %b: tensor<64x128xf16, #blocked>,
+                                          %meta: tensor<32x4xi16, #blocked>) -> tensor<32x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x128xf32, #blocked>
+    // CHECK-NOT: ttng.warp_group_dot
+    // CHECK: tt.dot_sparse {{.*}} -> tensor<32x128xf32, #[[$MMA]]>
+    // expected-remark @below {{sparse MMA version 3 acceleration not applied}}
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<32x32xf16, #blocked> meta tensor<32x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<32x128xf32, #blocked>
+    tt.return %0 : tensor<32x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// The 8-bit Hopper shape is m64nNk64: one instruction covers all four metadata
+// columns of a BLOCK_K=64 tile, so the metadata layout has no K-group register
+// basis, only the M-rep one.
+
+// CHECK-DAG: #[[$LINEAR:.+]] = #ttg.linear<{register = {{\[}}[0, 1], [64, 0]], lane = {{\[}}[8, 0], [0, 2], [1, 0], [2, 0], [4, 0]], warp = {{\[}}[16, 0], [32, 0]], block = []}>
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 128, 64]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm90_fp8
+  tt.func public @sparse_dot_sm90_fp8(%a: tensor<128x32xf8E4M3FN, #blocked>,
+                                      %b: tensor<64x128xf8E4M3FN, #blocked>,
+                                      %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // CHECK: ttg.convert_layout {{.*}} -> tensor<128x4xi16, #[[$LINEAR]]>
+    // CHECK: ttng.warp_group_dot {{.*}} meta {{.*}} -> tensor<128x128xf32, #[[$MMA]]>
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf8E4M3FN, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf8E4M3FN, #blocked> -> tensor<128x128xf32, #blocked>
     tt.return %0 : tensor<128x128xf32, #blocked>
   }
 }

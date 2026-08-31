@@ -96,13 +96,22 @@ def WGMMA_EltTypeAttr : I32EnumAttr<"WGMMAEltType",
 
 def WGMMA_OperandType : AnyTypeOf<[LLVM_AnyStruct, I64], "wgmma operand A/B type">;
 
-def NVGPU_WGMMAOp : NVGPU_Op<"wgmma", []> {
+def NVGPU_WGMMAOp : NVGPU_Op<"wgmma", [AttrSizedOperandSegments]> {
+  let description = [{
+    Emits one `wgmma.mma_async` instruction, or `wgmma.mma_async.sp` when the
+    optional $spMeta operand is present. $spMeta is the 32-bit sparsity
+    metadata this thread contributes; the sparsity selector is always 0, which
+    matches the metadata layout Triton builds (see getSparseMetadataLayout).
+    $k is the instruction's K, i.e. the dense K, which for the sparse form is
+    twice the number of K values the packed A operand holds.
+  }];
   let arguments = (ins WGMMA_OperandType:$opA, WGMMA_OperandType:$opB, I1:$useC, Optional<LLVM_AnyStruct>:$opC,
+                   Optional<I32>:$spMeta,
                    I32Attr:$m, I32Attr:$n, I32Attr:$k,
                    WGMMA_EltTypeAttr:$eltTypeC, WGMMA_EltTypeAttr:$eltTypeA, WGMMA_EltTypeAttr:$eltTypeB,
                    WGMMA_LayoutAttr:$layoutA, WGMMA_LayoutAttr:$layoutB);
   let results = (outs LLVM_AnyStruct:$res);
-  let assemblyFormat = "$opA `,` $opB `,` $useC (`,` $opC^)? attr-dict `:` functional-type(operands, $res)";
+  let assemblyFormat = "$opA `,` $opB `,` $useC (`,` $opC^)? (`meta` $spMeta^)? attr-dict `:` functional-type(operands, $res)";
 }
 
 def NVGPU_ClusterCTAIdOp : NVGPU_Op<"cluster_id", [Pure]> {

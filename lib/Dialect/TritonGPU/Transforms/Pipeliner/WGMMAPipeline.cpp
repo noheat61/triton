@@ -331,6 +331,12 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
   if (!isa<RankedTensorType>(dotOp.getA().getType())) {
     return {dotOp};
   }
+  // Splitting a sparse dot would have to split its metadata operand along K
+  // too. SparseBlockedToMMA keeps the sparse lhs in shared memory so this is
+  // unreachable; the check keeps it that way if that ever changes.
+  if (dotOp.isSparse()) {
+    return {dotOp};
+  }
 
   auto a = cast<TypedValue<RankedTensorType>>(dotOp.getA());
   auto b = cast<TypedValue<ttg::MemDescType>>(dotOp.getB());
@@ -365,7 +371,8 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
 
     auto dot = ttng::WarpGroupDotOp::create(
         builder, loc, dotOp.getType(), lhss[i], rhss[i], C, useC,
-        dotOp.getInputPrecision(), numImpreciseAcc, dotOp.getIsAsync());
+        /*aMeta=*/nullptr, dotOp.getInputPrecision(), numImpreciseAcc,
+        dotOp.getIsAsync());
     dots.push_back(dot);
     C = dot.getResult();
     useC = {};

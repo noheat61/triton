@@ -1032,7 +1032,8 @@ DotOperandEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
                                      ArrayRef<unsigned> warpsPerCTA,
                                      CGAEncodingAttr cgaLayout,
-                                     unsigned elemBitWidth) {
+                                     unsigned elemBitWidth,
+                                     bool rowMajorWarpOrder) {
   // Metadata thread mapping for mma.sp with selector=0. One int16 of metadata
   // describes 16 dense K elements, so one MMA spans
   // `instrKDense / 16` metadata columns: 2 for m16n8k32 (16-bit operands),
@@ -1045,6 +1046,13 @@ LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
   //   warp:
   //     (0, 0)...         -- N-warp: metadata duplicated (broadcast basis)
   //     (16, 0)...        -- M-warp: each warp covers next 16 rows
+  //
+  // The per-warp mapping is the same for MMAv2 (mma.sp.m16n8k32/k64) and MMAv3
+  // (wgmma.mma_async.sp.m64nNk32/k64): the PTX ISA illustrates the metadata
+  // layout of both with the same two figures, and both cover 16 rows of A per
+  // warp with the same 32-bit partition. What changes for MMAv3 is only which
+  // warp holds which rows, which follows the parent MMA's warp order and is
+  // handled by `rowMajorWarpOrder` below.
   //
   // Every basis moves along at most one output dim, and dropping the
   // broadcast bases leaves a bijection onto metaM x metaK, so this satisfies
@@ -1092,19 +1100,32 @@ LinearLayout getSparseMetadataLayout(MLIRContext *ctx, ArrayRef<int64_t> shape,
     regBases.push_back({0, (int32_t)c});
   }
 
-  // Warp basis order must match NvidiaMmaEncodingAttr which uses
-  // warpOrder = getMatrixOrder(rank=2, rowMajor=true) = {1, 0}. That means
-  // warp bit 0 points along dim 1 (N) and warp bit 1 points along dim 0 (M).
-  // For A-operand metadata, N-warps duplicate (broadcast basis); M-warps
-  // offset by 16 rows each.
+  // Warp basis order must match NvidiaMmaEncodingAttr, which uses
+  // warpOrder = getMatrixOrder(rank=2, rowMajor=!isHopper()). For Ampere that
+  // is {1, 0}: warp bit 0 points along dim 1 (N) and the higher bits along
+  // dim 0 (M). Hopper flips it to {0, 1} because a warpgroup stacks its four
+  // warps along M, so warp bit 0 must point along dim 0 there. For A-operand
+  // metadata, N-warps duplicate (broadcast basis); M-warps offset by 16 rows
+  // each, which for MMAv3 is exactly the PTX ISA's "warp %warpid % 4 supplies
+  // sparsity information for rows 16*(%warpid % 4) .. +15".
+  auto pushNWarpBases = [&](std::vector<std::vector<int32_t>> &bases) {
+    for (unsigned w = 1; w < warpsPerCTA[1]; w *= 2)
+      bases.push_back({0, 0});
+  };
+  auto pushMWarpBases = [&](std::vector<std::vector<int32_t>> &bases) {
+    int64_t warpRowsCovered = 16;
+    for (unsigned w = 1; w < warpsPerCTA[0]; w *= 2) {
+      bases.push_back({(int32_t)warpRowsCovered, 0});
+      warpRowsCovered *= 2;
+    }
+  };
   std::vector<std::vector<int32_t>> warpBases;
-  for (unsigned w = 1; w < warpsPerCTA[1]; w *= 2) {
-    warpBases.push_back({0, 0});
-  }
-  int64_t warpRowsCovered = 16;
-  for (unsigned w = 1; w < warpsPerCTA[0]; w *= 2) {
-    warpBases.push_back({(int32_t)warpRowsCovered, 0});
-    warpRowsCovered *= 2;
+  if (rowMajorWarpOrder) {
+    pushNWarpBases(warpBases);
+    pushMWarpBases(warpBases);
+  } else {
+    pushMWarpBases(warpBases);
+    pushNWarpBases(warpBases);
   }
 
   // M-rep register extension for metaM beyond warp coverage.
