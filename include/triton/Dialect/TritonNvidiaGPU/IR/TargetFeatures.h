@@ -58,7 +58,12 @@ public:
     return computeCapability >= 103 && computeCapability / 10 != 12;
   }
 
-  bool supportsI8Tcgen05MMA() const { return computeCapability == 100; }
+  // sm_100 and Thor's sm_110. ptxas is precise about this: it assembles
+  // tcgen05.mma.kind::i8 for sm_100a and sm_110a and rejects it for sm_103a
+  // with "Feature '.kind::i8' not supported on .target 'sm_103a'".
+  bool supportsI8Tcgen05MMA() const {
+    return computeCapability == 100 || computeCapability == 110;
+  }
   bool supportsExclusiveTMEMAlloc() const { return computeCapability == 107; }
   int getMaxTMEMColumns() const {
     return supportsExclusiveTMEMAlloc() ? 576 : 512;

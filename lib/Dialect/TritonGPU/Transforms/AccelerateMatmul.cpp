@@ -439,11 +439,16 @@ struct MMAEncodingResult {
 };
 
 // Unified implementation for DotOpInterface
+// `aElemTypeOverride`, when set, is the element type the instruction will
+// actually take rather than the one still on the operands -- the sparse pattern
+// widens fp8 to f16 for MMAv2 and has to pick the instruction shape for the
+// widened type.
 static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
                                                  PatternRewriter &rewriter,
                                                  int computeCapability,
                                                  int versionMajor,
-                                                 bool isSparse = false) {
+                                                 bool isSparse = false,
+                                                 Type aElemTypeOverride = {}) {
   auto oldRetType = cast<RankedTensorType>(dotOp.getD().getType());
   auto oldAType = cast<RankedTensorType>(dotOp.getA().getType());
 
@@ -457,9 +462,10 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
 
   auto CGALayout = getCGALayout(oldRetType.getEncoding());
   auto retShapePerCTA = getShapePerCTA(oldRetType);
-  auto instrShape =
-      mmaVersionToInstrShape(versionMajor, retShapePerCTA,
-                             oldAType.getElementType(), numWarps, isSparse);
+  Type aElemType =
+      aElemTypeOverride ? aElemTypeOverride : oldAType.getElementType();
+  auto instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,
+                                           aElemType, numWarps, isSparse);
   auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
                                       numWarps, instrShape);
 
@@ -578,6 +584,70 @@ public:
   }
 };
 
+static Value promoteOperand(OpBuilder &builder, Location loc, Value operand,
+                            Type promotedType) {
+  Type tensorPromotedType = cast<RankedTensorType>(operand.getType())
+                                .cloneWith(std::nullopt, promotedType);
+  Type operandElType =
+      cast<RankedTensorType>(operand.getType()).getElementType();
+  if (type::isFloat8(operandElType)) {
+    return FpToFpOp::create(builder, loc, tensorPromotedType, operand);
+  }
+  return arith::ExtFOp::create(builder, loc, tensorPromotedType, operand);
+}
+
+static bool mmav2SupportsFp8Operands(int computeCapability) {
+  // promote operands for sm < 89 since fp8 mma is not natively supported
+  // although PTX instructions for mma v2 w/ fp8 operands exist for sm90 and
+  // sm100, they are emulated as fp16 upcasts + fp16 HMMA in SASS. sm120 has
+  // hardware support for fp8 operands w/ mmav2.
+  return computeCapability == 89 || computeCapability / 10 == 12;
+}
+
+
+// Whether SparseBlockedToMMAv5 will take this dot: whether the target has a
+// tcgen05.mma.sp for these operands and whether this shape is one the metadata
+// layout that pattern builds actually covers.
+//
+// Both sparse patterns key off this, and nothing else may ask the question
+// independently. A dot that neither pattern claims is left as an unlowered
+// tt.dot_sparse and fails to compile, so the "is it v5's?" test and the "does
+// it need the MMAv2 fallback?" test have to be the same test.
+static bool supportSparseTcgen05MMA(int computeCapability, DotSparseOp dotOp) {
+  // tcgen05 exists on datacenter Blackwell only; consumer Blackwell has no
+  // TMEM and takes the MMAv2 path in SparseBlockedToMMA.
+  if (computeCapability < 100 || computeCapability >= 120)
+    return false;
+  if (lookupNumCTAs(dotOp) != 1)
+    return false;
+  auto aType = cast<RankedTensorType>(dotOp.getA().getType());
+  // The 8-bit kinds (.kind::f8f6f4, .kind::i8) and the 16-bit one
+  // (.kind::f16, which covers bf16 too). .kind::tf32 is 1:2 sparse rather than
+  // 2:4 and is not something tt.dot_sparse expresses.
+  unsigned aBitwidth = aType.getElementTypeBitWidth();
+  if (aBitwidth != 8 && aBitwidth != 16)
+    return false;
+  // The int8 tcgen05 MMA exists on sm_100 only -- sm_103 and Thor's sm_110 do
+  // not have it, which is why getMMAVersionSafe sends the dense int8 dot back
+  // to MMAv2 there. Do the same rather than emitting an instruction the chip
+  // cannot run.
+  if (aType.getElementType().isInteger(8) &&
+      !nvidia_gpu::TargetFeatures(computeCapability).supportsI8Tcgen05MMA())
+    return false;
+  auto retShapePerCTA = getShapePerCTA(cast<RankedTensorType>(dotOp.getType()));
+  if (retShapePerCTA.size() != 2)
+    return false;
+  // Mirror the dense shape rules in supportMMA: tcgen05 takes M % 64 == 0 on 4
+  // or 8 warps. M = 64 is Layout F, which uses only half the tensor-memory
+  // datapath lanes, and blockM = 64 on the metadata encoding describes exactly
+  // that -- the row 16 basis goes unused, which is the alignment-0 placement
+  // the accumulator picks too, as the spec's alignment restriction requires.
+  int numWarps = lookupNumWarps(dotOp);
+  if (numWarps != 4 && numWarps != 8)
+    return false;
+  return retShapePerCTA[0] >= 64 && retShapePerCTA[0] % 64 == 0;
+}
+
 class SparseBlockedToMMA : public mlir::OpRewritePattern<DotSparseOp> {
   int computeCapability;
 
@@ -594,9 +664,9 @@ public:
   // dot. Hopper prefers MMAv3 (wgmma.mma_async.sp) and falls back to MMAv2 for
   // shapes wgmma cannot express, mirroring getMMAVersionSafe's {3, 2} for the
   // dense dot -- there is no dense path to fall back to here, so a slower
-  // instruction beats failing to lower. Datacenter Blackwell's tcgen05.mma.sp
-  // is not implemented yet, and falling back to a lower version there would be
-  // slower than the dense dot it uses, so reject.
+  // instruction beats failing to lower. Datacenter Blackwell prefers
+  // tcgen05.mma.sp and hands whatever that cannot express back to MMAv2, on the
+  // same reasoning.
   static int getSparseMMAVersion(int computeCapability, DotSparseOp dotOp) {
     if (computeCapability >= 80 && computeCapability < 90)
       return 2;
@@ -611,6 +681,25 @@ public:
       remark.attachNote() << "Target compute capability (" << computeCapability
                           << ") supports sparse MMA v3.";
       return 2;
+    }
+    // Datacenter Blackwell normally goes through SparseBlockedToMMAv5. An
+    // 8-bit dot that pattern declines -- int8 on the parts without an int8
+    // tcgen05 MMA (sm_103, Thor's sm_110), or any M below the 128 its metadata
+    // layout assumes -- still has mma.sp::ordered_metadata, so take it rather
+    // than leaving the op unlowered.
+    //
+    // For most of those shapes the dense dot is on MMAv2 as well, since
+    // supportMMA(v5) wants M % 64 == 0 on 4 or 8 warps, so the fallback gives
+    // up nothing. The exception is M = 64 on 4 or 8 warps, where the dense dot
+    // does reach tcgen05 and this may lose to it; running slower still beats
+    // failing to compile.
+    //
+    // An fp8 dot that gets widened to f16 for the MMAv2 instruction is asked
+    // about *before* the widening, so it reaches this as 8-bit and is routed on
+    // its own kind.
+    if (computeCapability >= 100 && computeCapability < 120) {
+      if (!supportSparseTcgen05MMA(computeCapability, dotOp))
+        return 2;
     }
     return 0;
   }
@@ -654,15 +743,35 @@ public:
     if (versionMajor == 0)
       return failure();
 
-    auto mmaResult =
-        createMMAEncodingForDot(dotOp, rewriter, computeCapability,
-                                versionMajor, /*isSparse=*/true);
-    if (!mmaResult.mmaEnc)
-      return failure();
-
     Value a = dotOp.getA();
     Value b = dotOp.getB();
     Value aMeta = dotOp.getAMeta();
+
+    // Outside sm_89 and sm_12x, ptxas emulates MMAv2's fp8 instructions as an
+    // fp16 upcast plus an fp16 HMMA in SASS (see mmav2SupportsFp8Operands): on
+    // sm_110 that measures 4.7 TF/s where the f16 spelling of the same dot runs
+    // at 41.9. decomposeMixedModeDotOp widens the dense dot for this reason but
+    // runs after this pass, which is too late here -- everything below derives
+    // from the operand bitwidth, and an 8-bit dot gets the m16n8k64 metadata
+    // mapping, which a widened m16n8k32 instruction would misread. So widen
+    // first and let the rest of the pattern see f16. f16 represents every e4m3
+    // and e5m2 value exactly, so nothing is lost.
+    //
+    // MMAv2 only: wgmma.mma_async.sp and tcgen05.mma.sp take fp8 natively, and
+    // widening for them would halve the instruction's K for nothing.
+    Type aElemType = cast<RankedTensorType>(a.getType()).getElementType();
+    if (versionMajor == 2 && !mmav2SupportsFp8Operands(computeCapability) &&
+        llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemType)) {
+      aElemType = rewriter.getF16Type();
+      a = promoteOperand(rewriter, dotOp.getLoc(), a, aElemType);
+      b = promoteOperand(rewriter, dotOp.getLoc(), b, aElemType);
+    }
+
+    auto mmaResult =
+        createMMAEncodingForDot(dotOp, rewriter, computeCapability,
+                                versionMajor, /*isSparse=*/true, aElemType);
+    if (!mmaResult.mmaEnc)
+      return failure();
 
     // For sparse ops, use element type bitwidth directly.
     // computeOrigBitWidth halves bitwidth when JoinOp is in the backward
@@ -876,6 +985,126 @@ public:
         rewriter, loc, tokType, a, b, acc, acc.getToken(), /*useD=*/vTrue,
         /*pred=*/vTrue);
     mma.setTwoCtas(useTwoCTAs);
+
+    auto ld = triton::nvidia_gpu::TMEMLoadOp::create(
+        rewriter, loc, newAccType, tokType, acc, /*dep=*/mma.getToken());
+    rewriter.replaceOpWithNewOp<ConvertLayoutOp>(dotOp, oldRetType, ld);
+    return success();
+  }
+};
+
+// Datacenter Blackwell lowers tt.dot_sparse to tcgen05.mma.sp, whose sparsity
+// metadata lives in tensor memory rather than in registers.
+//
+// The metadata matrix layout is documented per MMA-kind. For the 8-bit kinds
+// (.kind::f8f6f4 and .kind::i8) it is the identity: tensor-memory lane l holds
+// the metadata of row l of A, and each 32-bit cell holds two adjacent i16
+// metadata columns, i.e. 32 dense K values. That is exactly a packed
+// TensorMemoryEncodingAttr (colStride 1) over the [M, K_dense/16] i16 metadata
+// tensor.
+//
+// The 16-bit kind (.kind::f16, which covers bf16) puts rows m and m + 8 in one
+// 32-bit cell instead, and lets row bit 3 pick the metadata column. That is the
+// 8-bit layout with row bit 3 and column bit 0 exchanged, which the
+// sparseMetaRowPaired flag on the same encoding selects -- so neither kind
+// needs a new encoding attribute or a new store path. It also only fills half
+// of the 64-bit granule the instruction addresses, so consecutive instructions
+// share a granule and the descriptor's sparsity selector picks the half; that
+// part is in MMAv5.cpp.
+//
+// M = 64 is Layout F, which drives only half the tensor-memory datapath lanes.
+// blockM = 64 on the encoding already describes that, but the spec then
+// requires A, D and the metadata to sit in the same half -- enforced in
+// TensorMemoryAllocation.cpp by joining the metadata allocation to the
+// accumulator's row group.
+class SparseBlockedToMMAv5 : public mlir::OpRewritePattern<DotSparseOp> {
+  int computeCapability;
+
+public:
+  SparseBlockedToMMAv5(mlir::MLIRContext *context, int computeCapability,
+                       int benefit)
+      : OpRewritePattern<DotSparseOp>(context, benefit),
+        computeCapability(computeCapability) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::DotSparseOp dotOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    RankedTensorType oldRetType = dotOp.getType();
+    if (!oldRetType.getEncoding() ||
+        mlir::isa<NvidiaMmaEncodingAttr>(oldRetType.getEncoding()))
+      return failure();
+
+    // Target and shape constraints both live here, so that whatever this
+    // declines SparseBlockedToMMA is guaranteed to pick up on MMAv2.
+    if (!supportSparseTcgen05MMA(computeCapability, dotOp))
+      return failure();
+
+    auto aType = cast<RankedTensorType>(dotOp.getA().getType());
+    auto retShapePerCTA = getShapePerCTA(oldRetType);
+
+    int numWarps = lookupNumWarps(dotOp);
+    Location loc = dotOp.getLoc();
+    MLIRContext *context = dotOp->getContext();
+    auto CGALayout = getCGALayout(oldRetType.getEncoding());
+
+    // Both multiplicands go to shared memory, as for the dense MMAv5 dot.
+    Value a = getSharedMemoryMMAOperand(dotOp.getA(), rewriter, 0,
+                                        /*allowTranspose=*/true);
+    Value b = getSharedMemoryMMAOperand(dotOp.getB(), rewriter, 1,
+                                        /*allowTranspose=*/true);
+
+    auto instrShape =
+        mmaVersionToInstrShape(/*version=*/5, retShapePerCTA,
+                               aType.getElementType(), numWarps);
+    auto accBitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
+    Attribute tensorMemorySpace =
+        triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
+
+    // Accumulator in tensor memory, as for the dense dot.
+    Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+        context, instrShape[0], instrShape[1], 32 / accBitwidth, CGALayout);
+    MemDescType accMemDescType =
+        MemDescType::get(oldRetType.getShape(), oldRetType.getElementType(),
+                         accEncoding, tensorMemorySpace,
+                         /*mutableMemory=*/true);
+    auto accDistEncoding =
+        nvidia_gpu::getDefaultLayoutForTmemLdSt(accMemDescType, numWarps);
+    auto newAccType = oldRetType.cloneWithEncoding(accDistEncoding);
+    Value cvtAcc =
+        ConvertLayoutOp::create(rewriter, loc, newAccType, dotOp.getC());
+    auto tokType = rewriter.getType<AsyncTokenType>();
+    auto acc = triton::nvidia_gpu::TMEMAllocOp::create(
+        rewriter, loc, accMemDescType, tokType, cvtAcc);
+
+    // Metadata in tensor memory, two i16 per 32-bit cell. Which two depends on
+    // the kind: the 8-bit kinds take adjacent columns of one row, and
+    // .kind::f16 takes rows m and m + 8 of one column, which is what
+    // sparseMetaRowPaired selects.
+    auto metaType = cast<RankedTensorType>(dotOp.getAMeta().getType());
+    bool rowPairedMeta = aType.getElementTypeBitWidth() == 16;
+    // blockM follows the instruction, so M = 64 gets the half-datapath
+    // placement (Layout F) that the accumulator above is already using.
+    Attribute metaEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+        context, /*blockM=*/instrShape[0], /*blockN=*/metaType.getShape()[1],
+        /*colStride=*/1, CGALayout, /*twoCTAs=*/false, /*fp4Padded=*/false,
+        /*sparseMetaRowPaired=*/rowPairedMeta);
+    MemDescType metaMemDescType = MemDescType::get(
+        metaType.getShape(), metaType.getElementType(), metaEncoding,
+        tensorMemorySpace, /*mutableMemory=*/false);
+    auto metaDistEncoding =
+        nvidia_gpu::getDefaultLayoutForTmemLdSt(metaMemDescType, numWarps);
+    Value cvtMeta = ConvertLayoutOp::create(
+        rewriter, loc, metaType.cloneWithEncoding(metaDistEncoding),
+        dotOp.getAMeta());
+    auto meta = triton::nvidia_gpu::TMEMAllocOp::create(
+        rewriter, loc, metaMemDescType, /*token=*/Type(), cvtMeta);
+
+    auto vTrue = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+    auto mma = triton::nvidia_gpu::TCGen5MMAOp::create(
+        rewriter, loc, tokType, a, b, acc, acc.getToken(), /*useD=*/vTrue,
+        /*pred=*/vTrue, /*twoCtas=*/false, /*multicast=*/false,
+        /*barriers=*/ValueRange{}, /*barrierPreds=*/ValueRange{},
+        /*isAsync=*/false, /*isUnsigned=*/false, meta.getResult());
 
     auto ld = triton::nvidia_gpu::TMEMLoadOp::create(
         rewriter, loc, newAccType, tokType, acc, /*dep=*/mma.getToken());
@@ -1164,26 +1393,6 @@ public:
 };
 } // namespace
 
-static Value promoteOperand(OpBuilder &builder, Location loc, Value operand,
-                            Type promotedType) {
-  Type tensorPromotedType = cast<RankedTensorType>(operand.getType())
-                                .cloneWith(std::nullopt, promotedType);
-  Type operandElType =
-      cast<RankedTensorType>(operand.getType()).getElementType();
-  if (type::isFloat8(operandElType)) {
-    return FpToFpOp::create(builder, loc, tensorPromotedType, operand);
-  }
-  return arith::ExtFOp::create(builder, loc, tensorPromotedType, operand);
-}
-
-static bool mmav2SupportsFp8Operands(int computeCapability) {
-  // promote operands for sm < 89 since fp8 mma is not natively supported
-  // although PTX instructions for mma v2 w/ fp8 operands exist for sm90 and
-  // sm100, they are emulated as fp16 upcasts + fp16 HMMA in SASS. sm120 has
-  // hardware support for fp8 operands w/ mmav2.
-  return computeCapability == 89 || computeCapability / 10 == 12;
-}
-
 // promote operands of dot op if the existing combination is not natively
 // supported.
 static void decomposeMixedModeDotOp(ModuleOp mod, int computeCapability) {
@@ -1280,7 +1489,7 @@ public:
     patterns.add<SparseBlockedToMMA>(context, computeCapability, benefitDefault);
     patterns.add<ScaledBlockedToMMA>(context, computeCapability, benefitSM120);
     populateDecomposeScaledBlockedPatterns(patterns, benefitDefault);
-    patterns.add<BlockedToMMAv5, ScaledBlockedToMMAv5>(
+    patterns.add<BlockedToMMAv5, ScaledBlockedToMMAv5, SparseBlockedToMMAv5>(
         context, computeCapability, benefitMMAv5);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())

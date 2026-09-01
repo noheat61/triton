@@ -336,6 +336,11 @@ py::object layoutToGluon(Attribute layout, bool isRubin = false) {
     }
     return layouts.TensorMemoryScalesLayout(cgaLayout);
   } else if (auto tmem = dyn_cast<ttng::TensorMemoryEncodingAttr>(layout)) {
+    // The sparsity metadata layout only ever appears between AccelerateMatmul
+    // and the MMA lowering, so it has no Gluon spelling to round-trip to.
+    if (tmem.getSparseMetaRowPaired())
+      throw py::value_error(
+          "sparse metadata tensor memory layout has no Gluon equivalent");
     return layouts.TensorMemoryLayout(
         std::vector<unsigned>{tmem.getBlockM(), tmem.getBlockN()},
         tmem.getColStride(), getCgaLayoutBases(tmem.getCGALayout()),
@@ -608,7 +613,7 @@ void init_gluon_ir(py::module_ &m) {
              auto cgaLayout = buildCgaLayoutAttr(ctx, cgaBases, /*rank=*/2);
              return self.getChecked<ttng::TensorMemoryEncodingAttr>(
                  ctx, block[0], block[1], colStride, cgaLayout, twoCTAs,
-                 fp4Padded);
+                 fp4Padded, /*sparseMetaRowPaired=*/false);
            })
       .def(
           "get_tensor_memory_scales_layout",

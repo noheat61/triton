@@ -112,6 +112,16 @@ def TTG_TensorMemoryEncodingAttr
     tensor memory between elements is undefined.
     `twoCTAs` indicates that the tensor memory is laid out for twoCTA mode,
     i.e., `cta_group::2`.
+    `sparseMetaRowPaired` selects the sparsity metadata layout that the 16-bit
+    `tcgen05.mma.sp` kinds read (`.kind::f16`, and `.kind::tf32` by the same
+    figure). Those pack rows `m` and `m + 8` into one 32-bit tensor-memory
+    cell, and let row bit 3 pick the metadata column, where every other packed
+    layout puts two adjacent columns of a single row in a cell. Relative to the
+    dense layout it is exactly the swap of row bit 3 with column bit 0, so it
+    needs `colStride` 1 and a `blockM` that has a row bit 3 to swap, i.e. 64 or
+    128. `blockM` 64 is the half-datapath placement (Layout F), which carries
+    the extra requirement that A, D and the metadata share a row group; that is
+    enforced in TensorMemoryAllocation, not here.
   }];
   let parameters = (
     ins
@@ -120,7 +130,8 @@ def TTG_TensorMemoryEncodingAttr
     "unsigned":$colStride,
     TTNG_CGALayoutRankTwoParam:$CGALayout,
     DefaultValuedParameter<"bool", "false">:$twoCTAs,
-    DefaultValuedParameter<"bool", "false">:$fp4Padded
+    DefaultValuedParameter<"bool", "false">:$fp4Padded,
+    DefaultValuedParameter<"bool", "false">:$sparseMetaRowPaired
   );
   let skipDefaultBuilders = 1;
   let builders = [
@@ -129,9 +140,10 @@ def TTG_TensorMemoryEncodingAttr
                      "unsigned":$colStride,
                      "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout,
                      CArg<"bool", "false">:$twoCTAs,
-                     CArg<"bool", "false">:$fp4Padded), [{
+                     CArg<"bool", "false">:$fp4Padded,
+                     CArg<"bool", "false">:$sparseMetaRowPaired), [{
       return $_get($_ctxt, blockM, blockN, colStride, CGALayout, twoCTAs,
-                   fp4Padded);
+                   fp4Padded, sparseMetaRowPaired);
     }]>
   ];
   let genVerifyDecl = 1;

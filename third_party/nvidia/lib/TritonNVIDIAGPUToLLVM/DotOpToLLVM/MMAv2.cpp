@@ -1072,10 +1072,38 @@ static void callMmaSparse(PTXBuilder &builder, int b, const BaseOffset &baseA,
   mma(ops);
 }
 
+// ptxas emits, for every `mma.sp` this backend produces:
+//
+//   Advisory: Modifier '.sp::ordered_metadata' should be used on instruction
+//   'mma' instead of modifier '.sp' as it is expected to have substantially
+//   reduced performance on some future architectures
+//
+// `sp::ordered_metadata` is the same instruction with a promise that each 4-bit
+// group's two 2-bit indices are ordered, which restricts the legal metadata to
+// {0100, 1000, 1100, 1001, 1101, 0110, 1110}. The compression this op's users
+// perform fills the indices in increasing order, so every value it can produce
+// is already in that set and the encoding is unchanged -- switching mnemonics
+// is a pure opcode change, which the bit-exact tests confirm.
+//
+// It needs PTX 8.5 (8.7 for sm_120a), so keep the legacy form on sm_80-sm_89
+// rather than raising their PTX floor for no measured gain, and use the ordered
+// form on Blackwell, where the advisory's "future architectures" begins.
+static std::string sparseMmaOpcode(TensorCoreType mmaType,
+                                   int computeCapability) {
+  const std::string &instr = mmaInstrPtxSparse.at(mmaType);
+  constexpr StringRef legacy = "mma.sp";
+  assert(StringRef(instr).starts_with(legacy) &&
+         "sparse mma opcode must start with mma.sp");
+  if (computeCapability < 100)
+    return instr;
+  return "mma.sp::ordered_metadata" + instr.substr(legacy.size());
+}
+
 LogicalResult convertMMASparseDot(triton::DotSparseOp op,
                                   triton::DotSparseOp::Adaptor adaptor,
                                   const LLVMTypeConverter *typeConverter,
-                                  ConversionPatternRewriter &rewriter) {
+                                  ConversionPatternRewriter &rewriter,
+                                  int computeCapability) {
   auto loc = op.getLoc();
   auto aTensorTy = cast<RankedTensorType>(op.getA().getType());
   auto bTensorTy = cast<RankedTensorType>(op.getB().getType());
@@ -1196,7 +1224,8 @@ LogicalResult convertMMASparseDot(triton::DotSparseOp op,
           int bKBase = numRegisters.k * k * 2;
 
           PTXBuilder builder;
-          auto &mma = *builder.create(mmaInstrPtxSparse.at(mmaType));
+          auto &mma =
+              *builder.create(sparseMmaOpcode(mmaType, computeCapability));
 
           callMmaSparse(builder, b, baseA, bKBase, mma, numMmaRets,
                         colsPerThread, numCPackedElem, batchOffset, ha, hb, fc,

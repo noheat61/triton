@@ -1075,6 +1075,15 @@ static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
   return success();
 }
 
+// $a holds only the kept elements when sparse, so its K is half of $b's.
+bool TCGen5MMAOp::verifyDims() {
+  auto aShape = getA().getType().getShape();
+  auto bShape = getB().getType().getShape();
+  auto aK = aShape[aShape.size() - 1];
+  auto bK = bShape[bShape.size() - 2];
+  return isSparse() ? aK * 2 == bK : aK == bK;
+}
+
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -1110,6 +1119,26 @@ LogicalResult TCGen5MMAOp::verify() {
     return emitOpError("Return operand must have a TensorMemory encoding");
   if (retEnc.getFp4Padded())
     return emitOpError("Accumulator must not be fp4_padded");
+
+  if (auto aMeta = getAMeta()) {
+    auto metaTy = cast<MemDescType>(aMeta.getType());
+    if (metaTy.getMemorySpace() !=
+        TensorMemorySpaceAttr::get(getContext()))
+      return emitOpError("sparsity metadata must live in tensor memory");
+    if (failed(verifySparseDotMetadata(getOperation(),
+                                       getA().getType().getShape(), metaTy)))
+      return failure();
+    // The metadata matrix packs two i16 per 32-bit tensor-memory cell, which is
+    // what a TensorMemoryEncodingAttr with colStride 1 describes. Which two
+    // depends on the MMA kind, and sparseMetaRowPaired on that encoding carries
+    // the difference; see SparseBlockedToMMAv5.
+    auto metaEnc = dyn_cast<TensorMemoryEncodingAttr>(metaTy.getEncoding());
+    if (!metaEnc || metaEnc.getColStride() != 1)
+      return emitOpError("sparsity metadata must have a packed TensorMemory "
+                         "encoding (colStride 1)");
+    if (!metaTy.getElementType().isInteger(16))
+      return emitOpError("sparsity metadata must be i16");
+  }
 
   // Check colStride of TMEM operands
   if (auto tmem = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
@@ -1293,11 +1322,11 @@ void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
                         Value a, Value b, Value d, Value accDep, Value useD,
                         Value pred, bool twoCtas, bool multicast,
                         ValueRange barriers, ValueRange barrierPreds,
-                        bool isAsync, bool isUnsigned) {
+                        bool isAsync, bool isUnsigned, Value aMeta) {
   if (!barriers.empty()) {
     isAsync = true;
   }
-  build(builder, state, token, a, b, d, accDep, useD, pred, barriers,
+  build(builder, state, token, a, b, d, accDep, useD, pred, aMeta, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
         twoCtas ? builder.getUnitAttr() : UnitAttr(),
         multicast ? builder.getUnitAttr() : UnitAttr(),

@@ -513,6 +513,13 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
 
+    # tl.dot_sparse on Hopper lowers to wgmma.mma_async.sp. That path is
+    # implemented and statically checked, but its numerics have never been run on
+    # a Hopper device, so it is off by default rather than silently handing back
+    # results nobody has confirmed. Set this to verify it on real hardware; drop
+    # the knob once that is done.
+    enable_unverified_sparse_wgmma: env_bool = env_bool("TRITON_ENABLE_UNVERIFIED_SPARSE_WGMMA")
+
 
 class amd_knobs(base_knobs):
     use_buffer_ops: env_bool = env_bool("AMDGCN_USE_BUFFER_OPS", True)

@@ -36,16 +36,22 @@ def min_dot_size(target: GPUTarget):
 
 
 def get_min_sparse_dot_size(target: GPUTarget):
-
     # The returned K is the dense K, i.e. twice the K of the 2:4 sparse lhs.
     def check_dot_compatibility(lhs_type, rhs_type) -> Tuple[int, int, int]:  # [m, n, k]
         lhs_bitwidth = lhs_type.scalar.primitive_bitwidth
         rhs_bitwidth = rhs_type.scalar.primitive_bitwidth
         assert lhs_bitwidth == rhs_bitwidth, "lhs and rhs bitwidth must be the same"
+        # The bound is the sparse instruction's own m16n8, on every target. The
+        # wider shapes some paths want are not bounds, because the compiler
+        # routes what they cannot take back to mma.sp rather than failing:
+        # wgmma.mma_async.sp's m64 on Hopper, and tcgen05.mma.sp's M % 64 == 0
+        # on 4 or 8 warps on datacenter Blackwell. See supportSparseTcgen05MMA
+        # in AccelerateMatmul.cpp, which decides that routing in one place for
+        # both sparse patterns.
         if lhs_bitwidth == 8:
-            # mma.sp.sync.aligned.m16n8k64
+            # mma.sp / wgmma.mma_async.sp with a dense K of 64
             return (16, 8, 64)
-        # mma.sp.sync.aligned.m16n8k32
+        # mma.sp / wgmma.mma_async.sp with a dense K of 32
         return (16, 8, 32)
 
     return check_dot_compatibility
@@ -53,23 +59,29 @@ def get_min_sparse_dot_size(target: GPUTarget):
 
 def get_supported_sparse_dot_dtypes(target: GPUTarget):
     capability = target.arch
-    # Sparse dot lowers to `mma.sp.sync` (MMAv2) on sm_80-sm_89 and again on
-    # consumer Blackwell (sm_120+): those parts have no TMEM, so
-    # `tcgen05.mma.sp` is unavailable there and `mma.sp.sync` is the sparse
-    # instruction, exactly as for the dense dot. Hopper uses MMAv3
-    # (`wgmma.mma_async.sp`). Datacenter Blackwell's `tcgen05.mma.sp` is not
-    # implemented yet, and falling back to a lower version there would be
-    # slower than the dense `tl.dot` it uses, so reject.
-    if not (80 <= capability < 100 or 120 <= capability < 130):
+    # Sparse dot lowers to `mma.sp` (MMAv2) on sm_80-sm_89 and again on consumer
+    # Blackwell (sm_120+): those parts have no TMEM, so `tcgen05.mma.sp` is
+    # unavailable there and `mma.sp` is the sparse instruction, exactly as for
+    # the dense dot. Hopper uses MMAv3 (`wgmma.mma_async.sp`) and datacenter
+    # Blackwell MMAv5 (`tcgen05.mma.sp`).
+    if not (80 <= capability < 130):
+        return lambda input_dtype: False
+
+    # Hopper is off by default: the MMAv3 path is implemented and statically
+    # checked but its numerics have never been run on a Hopper device, and the
+    # rest of this file only enables paths that have. Nothing about it is shared
+    # with the MMAv5 path, so verifying Blackwell does not cover it.
+    if 90 <= capability < 100 and not knobs.nvidia.enable_unverified_sparse_wgmma:
         return lambda input_dtype: False
 
     def is_supported(input_dtype):
-        # mma.sp.sync.aligned.m16n8k32 / wgmma.mma_async.sp.m64nNk32
+        # mma.sp.sync.aligned.m16n8k32 / wgmma.mma_async.sp.m64nNk32 /
+        # tcgen05.mma.sp.kind::f16
         if input_dtype.name in ("fp16", "bf16"):
             return True
-        # mma.sp.sync.aligned.m16n8k64 / wgmma.mma_async.sp.m64nNk64. Triton's
-        # IR has signless integers, so only the signed .s8 variant is
-        # reachable, as for the dense int8 dot.
+        # mma.sp.sync.aligned.m16n8k64 / wgmma.mma_async.sp.m64nNk64 /
+        # tcgen05.mma.sp.kind::i8. Triton's IR has signless integers, so only
+        # the signed .s8 variant is reachable, as for the dense int8 dot.
         if input_dtype.name == "int8":
             return True
         # The fp8 flavours of m16n8k64 need sm_89 (ptxas rejects them below).
@@ -704,4 +716,8 @@ please share the reproducer above with Triton project.
     @functools.lru_cache()
     def hash(self):
         version = get_ptxas_version(self.target.arch)
-        return f'{version}-{self.target.arch}'
+        # The Hopper sparse knob changes which instruction tl.dot_sparse lowers
+        # to, so it has to separate cache entries: without it, a kernel compiled
+        # once with the knob set would keep being served after it is unset.
+        sparse_wgmma = int(bool(knobs.nvidia.enable_unverified_sparse_wgmma))
+        return f'{version}-{self.target.arch}-spwgmma{sparse_wgmma}'

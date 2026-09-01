@@ -327,6 +327,24 @@ allocateTMem(Operation *parentOp,
         }
       }
     }
+    // The same restriction covers tcgen05.mma.sp's sparsity metadata. At M = 64
+    // the instruction is on Layout F, which drives only half the tensor-memory
+    // datapath lanes, and the spec's alignment restriction says A, D and the
+    // metadata must all pick the same half. A 64-row metadata allocation left
+    // to itself is free to land in the other half, and then the instruction
+    // reads metadata that was never written.
+    if (auto mmaOp = dyn_cast<TCGen5MMAOp>(op)) {
+      if (Value aMeta = mmaOp.getAMeta()) {
+        auto metaTy = cast<ttg::MemDescType>(aMeta.getType());
+        if (getTmemAllocSizes(metaTy).numRows == 64) {
+          SmallVector<Operation *> metaAllocs = getAlloc(aMeta);
+          SmallVector<Operation *> accAllocs = getAlloc(mmaOp.getAccumulator());
+          for (Operation *metaAlloc : metaAllocs)
+            for (Operation *accAlloc : accAllocs)
+              rowIdConstraints.joinOps(metaAlloc, accAlloc);
+        }
+      }
+    }
   });
   int totalMemorySize = 0;
   MemoryBitMap memoryMap;

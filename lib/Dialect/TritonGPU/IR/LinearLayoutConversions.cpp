@@ -1220,6 +1220,18 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
                           tile.isSurjective());
     }
   }
+  if (encoding.getSparseMetaRowPaired()) {
+    // The metadata layout the 16-bit tcgen05.mma.sp kinds read differs from the
+    // dense one by exactly one exchange: row bit 3 carries the metadata column
+    // and column bit 0 carries row 8, because one 32-bit cell holds rows m and
+    // m + 8 of a single column rather than two columns of a single row.
+    auto bases = tile.getBases();
+    assert(bases[kRow].size() > 3 && !bases[kCol].empty() &&
+           "sparseMetaRowPaired needs blockM 64 or 128 and two columns");
+    std::swap(bases[kRow][3], bases[kCol][0]);
+    tile = LinearLayout(std::move(bases), tile.getOutDims(),
+                        tile.isSurjective());
+  }
   auto repsM = shapePerCTA[0] / tile.getOutDimSize(dims[0]);
   auto repsN = shapePerCTA[1] / tile.getOutDimSize(dims[1]);
   assert(repsM >= 1 && repsN >= 1);

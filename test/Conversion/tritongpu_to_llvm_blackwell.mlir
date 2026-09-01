@@ -1694,3 +1694,76 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
     tt.return
   }
 }
+
+// -----
+
+// The 8-bit sparse dot emits tcgen05.mma.sp, whose [sp-meta-tmem] operand sits
+// between b-desc and idesc, and whose instruction descriptor sets the sparsity
+// bit (2) with a sparsity selector of 0 -- the only valid selector for the
+// 8-bit kinds, where every metadata column is selected.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_meta = #ttng.tensor_memory_encoding<blockM = 128, blockN = 8, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: @tc_gen5_sparse_int8_mma
+  // Descriptor for signed i8 with sparsity: same as the dense one plus bit 2.
+  // CHECK: llvm.mlir.constant(136316068 : i32) : i32
+  // The metadata address advances by 2 tensor-memory columns per instruction:
+  // one instruction covers 64 dense K, i.e. 4 i16 metadata columns.
+  // CHECK: tcgen05.mma.sp.cta_group::1.kind::i8 [ $0 + 0 ], $1, $2, [ $3 + 0 ], $4, $5;
+  // CHECK: tcgen05.mma.sp.cta_group::1.kind::i8 [ $0 + 0 ], $1, $2, [ $3 + 2 ], $4, $5;
+  tt.func @tc_gen5_sparse_int8_mma(%a: !ttg.memdesc<128x64xi8, #shared, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<128x128xi8, #shared1, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable>,
+                       %meta: !ttg.memdesc<128x8xi16, #tmem_meta, #ttng.tensor_memory>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    ttng.tc_gen5_mma %a meta %meta, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<128x64xi8, #shared, #ttg.shared_memory> meta !ttg.memdesc<128x8xi16, #tmem_meta, #ttng.tensor_memory>,
+       !ttg.memdesc<128x128xi8, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xi32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+    tt.return
+  }
+}
+
+// -----
+
+// .kind::f16 metadata is 32 bits per tensor-memory lane, half of the 64-bit
+// granule the instruction addresses. So consecutive instructions share a
+// granule: the address stays put and the sparsity selector (descriptor bits
+// 0-1) picks the half. Addressing the odd column directly instead faults with
+// a misaligned address on hardware.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 16}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_meta = #ttng.tensor_memory_encoding<blockM = 128, blockN = 4, colStride = 1, sparseMetaRowPaired = true>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: @tc_gen5_sparse_f16_mma
+  // Two instructions covering 32 dense K each, both reading the same 64-bit
+  // metadata granule; the descriptors differ only in the sparsity selector.
+  // CHECK: llvm.mlir.constant(136314900 : i32) : i32
+  // CHECK: tcgen05.mma.sp.cta_group::1.kind::f16 [ $0 + 0 ], $1, $2, [ $3 + 0 ], $4, $5;
+  // CHECK: llvm.mlir.constant(136314901 : i32) : i32
+  // CHECK: tcgen05.mma.sp.cta_group::1.kind::f16 [ $0 + 0 ], $1, $2, [ $3 + 0 ], $4, $5;
+  tt.func @tc_gen5_sparse_f16_mma(%a: !ttg.memdesc<128x32xf16, #shared, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<64x128xf16, #shared1, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %meta: !ttg.memdesc<128x4xi16, #tmem_meta, #ttng.tensor_memory>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    ttng.tc_gen5_mma %a meta %meta, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<128x32xf16, #shared, #ttg.shared_memory> meta !ttg.memdesc<128x4xi16, #tmem_meta, #ttng.tensor_memory>,
+       !ttg.memdesc<64x128xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+    tt.return
+  }
+}

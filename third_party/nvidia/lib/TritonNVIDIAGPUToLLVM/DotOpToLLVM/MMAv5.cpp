@@ -153,7 +153,8 @@ static scaleKind getScaleKind(ttng::TCGen5MMAScaledOp op, int blockK) {
 
 static Value createInstDescriptor(ConversionPatternRewriter &rewriter,
                                   ttng::TCGen5MMAOp op, int M, int N,
-                                  bool transposeA, bool transposeB, int kSize) {
+                                  bool transposeA, bool transposeB, int kSize,
+                                  bool isSparse, unsigned sparsitySelector) {
   Location loc = op.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   union TCGen5InstructionDescriptor {
@@ -213,6 +214,14 @@ static Value createInstDescriptor(ConversionPatternRewriter &rewriter,
   }
   if (kSize == 64)
     desc.kSize = 1;
+  if (isSparse) {
+    desc.sparsity = 1;
+    // The selector picks which sub-columns of the tensor-memory metadata matrix
+    // feed the instruction. The 8-bit kinds take a whole 64-bit granule and
+    // must pass 0; .kind::f16 takes 32 bits of one and the selector says which
+    // half. See the caller.
+    desc.sparsitySelector = sparsitySelector;
+  }
 
   return b.int_val(32, desc.descriptor);
 }
@@ -384,6 +393,9 @@ struct MMAInstOperands {
   Value descriptor;
   Value scaleA;
   Value scaleB;
+  // tcgen05.mma.sp reads its 2:4 sparsity metadata from tensor memory. Set
+  // only for a sparse dot, which turns the instruction into its .sp form.
+  std::optional<MemDescOperand> aMeta;
 };
 
 std::string getCollectorModifier(CollectorAction reuse, StringRef operand) {
@@ -410,15 +422,25 @@ void createGen5MMA(ConversionPatternRewriter &rewriter, Location loc,
                    bool twoCTAs, OperandReuse reuse) {
   PTXBuilder ptxBuilder;
   std::string opcode =
-      "tcgen05.mma.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
+      std::string("tcgen05.mma") + (inst.aMeta ? ".sp" : "") +
+      ".cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
       ".kind::" + kind.str() + getCollectorModifier(reuse.a, "a") +
       getCollectorModifier(reuse.b, "b");
   auto *accOp = ptxBuilder.newAddrOperand(d.base, "r", *d.offset);
   auto *aOp = a.offset ? ptxBuilder.newAddrOperand(a.base, "r", *a.offset)
                        : ptxBuilder.newOperand(a.base, "l");
   auto *bOp = ptxBuilder.newOperand(b, "l");
+  // [sp-meta-tmem] sits between the b-descriptor and idesc. Create it here so
+  // the inline asm operand numbering matches the order operands are printed in.
+  PTXBuilder::Operand *aMetaOp = nullptr;
+  if (inst.aMeta)
+    aMetaOp = ptxBuilder.newAddrOperand(inst.aMeta->base, "r",
+                                        *inst.aMeta->offset);
   auto *instDescOp = ptxBuilder.newOperand(inst.descriptor, "r");
-  SmallVector<PTXBuilder::Operand *> operands{accOp, aOp, bOp, instDescOp};
+  SmallVector<PTXBuilder::Operand *> operands{accOp, aOp, bOp};
+  if (aMetaOp)
+    operands.push_back(aMetaOp);
+  operands.push_back(instDescOp);
   assert(bool(inst.scaleA) == bool(inst.scaleB));
   if (inst.scaleA) {
     operands.push_back(ptxBuilder.newAddrOperand(inst.scaleA, "r"));
@@ -501,6 +523,11 @@ struct DotConversion {
 
   int numBitsPerElementA;
   int numBitsPerElementB;
+  // K values of operand B consumed per K value of operand A: 1 for a dense dot,
+  // 2 for tcgen05.mma.sp, whose packed lhs holds half of the dense K while the
+  // rhs still holds all of it. The instruction's kind already implies the dense
+  // K, so nothing else changes.
+  int kRatioBOverA = 1;
   StringRef kind;
   GetInstOperandsFn getInstOperands;
 };
@@ -585,7 +612,7 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
   SmallVector<unsigned> aOperandShape = {mmaSizeM, mmaSizeK};
   // For M=128 twoCTAs, A and C have the same split and B has a split half of C
   // along N.
-  SmallVector<unsigned> bOperandShape = {mmaSizeK,
+  SmallVector<unsigned> bOperandShape = {mmaSizeK * op.kRatioBOverA,
                                          mmaSizeN / (twoCTAs ? 2 : 1)};
 
   std::unique_ptr<DotOpMmaMemLoader> aLoader;
@@ -706,8 +733,9 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
         dLoader.tmemLoad(m * mmaSizeM, n * mmaSizeN, rewriter, loc);
     MemDescOperand a = aLoader->memLoad(m * aOperandShape[0], op.getKOffset(k),
                                         rewriter, loc, op.getKSize(k));
-    Value b = bLoader->smemLoad(op.getKOffset(k), n * bOperandShape[1],
-                                rewriter, loc, op.getKSize(k));
+    Value b = bLoader->smemLoad(op.getKOffset(k) * op.kRatioBOverA,
+                                n * bOperandShape[1], rewriter, loc,
+                                op.getKSize(k) * op.kRatioBOverA);
     Value useInitAcc = k == 0 ? useDFlag : tb.i1_val(1);
     createGen5MMA(rewriter, loc, op.kind, a, b, accAddress, elect,
                   op.getInstOperands(desc, m, n, k), useInitAcc, twoCTAs,
@@ -771,13 +799,58 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
 
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
+  bool isSparse = op.isSparse();
+  if (isSparse) {
+    // tcgen05.mma.sp reads the same number of A bytes as the dense instruction
+    // of the same kind but covers twice the dense K, so only operand B's K step
+    // doubles. 2xfp8 (mmaSizeK 64) is a separate widening we do not combine
+    // with sparsity.
+    dot.mmaSizeK = 256 / aTensorTy.getElementTypeBitWidth();
+    dot.kRatioBOverA = 2;
+  }
 
-  dot.getInstOperands = [&](const DotConversion::InstDesc &desc, int, int,
-                            int) -> MMAInstOperands {
+  // Sparsity metadata resides in tensor memory. One instruction consumes the
+  // metadata columns describing its dense K, i.e. 2 * mmaSizeK dense values,
+  // which is 2 * mmaSizeK / 16 columns of i16.
+  std::optional<DotOpMmaV5TmemLoader> metaLoader;
+  unsigned metaColsPerInst = 0;
+  // The instruction addresses its metadata in 64-bit granules, i.e. pairs of
+  // tensor-memory columns. An 8-bit kind's metadata fills a granule (dense
+  // K = 64 is 4 columns of i16), so the address walks two columns per
+  // instruction and the sparsity selector stays 0. .kind::f16 only needs
+  // 32 bits (dense K = 32 is 2 columns of i16), so consecutive instructions
+  // share a granule: the address advances every other instruction and the
+  // selector picks the half. Addressing the odd column directly instead faults
+  // with a misaligned address on sm_110.
+  bool metaHalfGranule = false;
+  if (isSparse) {
+    auto metaTy = cast<MemDescType>(op.getAMeta().getType());
+    metaLoader = DotOpMmaV5TmemLoader::build(loc, rewriter, metaTy,
+                                             adaptor.getAMeta(),
+                                             metaTy.getElementTypeBitWidth());
+    metaColsPerInst = (2 * dot.mmaSizeK) / 16;
+    metaHalfGranule = aTensorTy.getElementTypeBitWidth() == 16;
+  }
+
+  dot.getInstOperands = [&](const DotConversion::InstDesc &desc, int m, int,
+                            int k) -> MMAInstOperands {
+    std::optional<MemDescOperand> aMeta;
+    unsigned sparsitySelector = 0;
+    if (metaLoader) {
+      int metaK = k;
+      if (metaHalfGranule) {
+        sparsitySelector = k & 1;
+        metaK = k & ~1;
+      }
+      aMeta = metaLoader->tmemLoad(m * mmaSizeM, metaK * metaColsPerInst,
+                                   rewriter, loc);
+    }
     return {createInstDescriptor(rewriter, op, desc.mmaSizeM, desc.mmaSizeN,
-                                 desc.transA, desc.transB, dot.mmaSizeK),
+                                 desc.transA, desc.transB, dot.mmaSizeK,
+                                 isSparse, sparsitySelector),
             {},
-            {}};
+            {},
+            aMeta};
   };
 
   return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),

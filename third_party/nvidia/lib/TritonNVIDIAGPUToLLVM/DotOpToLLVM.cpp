@@ -29,7 +29,8 @@ LogicalResult convertMMADotScaled(triton::DotScaledOp op,
 LogicalResult convertMMASparseDot(triton::DotSparseOp op,
                                   triton::DotSparseOp::Adaptor adaptor,
                                   const LLVMTypeConverter *typeConverter,
-                                  ConversionPatternRewriter &rewriter);
+                                  ConversionPatternRewriter &rewriter,
+                                  int computeCapability);
 
 LogicalResult convertWGMMA(triton::nvidia_gpu::WarpGroupDotOp op,
                            triton::nvidia_gpu::WarpGroupDotOp::Adaptor adaptor,
@@ -62,15 +63,20 @@ struct SparseDotOpConversion
     : public ConvertOpToLLVMPattern<triton::DotSparseOp> {
   using ConvertOpToLLVMPattern<triton::DotSparseOp>::ConvertOpToLLVMPattern;
 
-  SparseDotOpConversion(LLVMTypeConverter &converter, int,
+  SparseDotOpConversion(LLVMTypeConverter &converter, int computeCapability,
                         PatternBenefit benefit)
-      : ConvertOpToLLVMPattern<triton::DotSparseOp>(converter, benefit) {}
+      : ConvertOpToLLVMPattern<triton::DotSparseOp>(converter, benefit),
+        computeCapability(computeCapability) {}
 
   LogicalResult
   matchAndRewrite(triton::DotSparseOp op, triton::DotSparseOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    return convertMMASparseDot(op, adaptor, getTypeConverter(), rewriter);
+    return convertMMASparseDot(op, adaptor, getTypeConverter(), rewriter,
+                               computeCapability);
   }
+
+private:
+  int computeCapability;
 };
 
 struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {

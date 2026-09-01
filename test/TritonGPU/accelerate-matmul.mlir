@@ -1220,21 +1220,143 @@ module attributes {"ttg.target" = "cuda:86", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
-// Sparse dot is not converted on datacenter Blackwell: sm_100 has
-// tcgen05.mma.sp, and falling back to a lower MMA version there would be
-// slower than the dense path. The op must survive the pass unchanged.
+// fp16 and bf16 take the MMAv5 path on datacenter Blackwell too, through
+// .kind::f16. Their metadata layout is not the 8-bit one: a 32-bit
+// tensor-memory cell holds rows m and m + 8 of one metadata column instead of
+// two columns of one row, which is what sparseMetaRowPaired selects.
 
+// CHECK-DAG: #[[$TMEM_META_F16:.+]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 4, colStride = 1, sparseMetaRowPaired = true>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: sparse_dot_sm100_unsupported
-  tt.func public @sparse_dot_sm100_unsupported(%a: tensor<128x32xf16, #blocked>,
-                                               %b: tensor<64x128xf16, #blocked>,
-                                               %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
+  // CHECK-LABEL: sparse_dot_sm100_f16
+  tt.func public @sparse_dot_sm100_f16(%a: tensor<128x32xf16, #blocked>,
+                                       %b: tensor<64x128xf16, #blocked>,
+                                       %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-    // CHECK-NOT: ttg.nvidia_mma
-    // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xf32, #blocked>
+    // CHECK: ttng.tmem_alloc {{.*}} -> !ttg.memdesc<128x4xi16, #[[$TMEM_META_F16]], #ttng.tensor_memory>
+    // CHECK: ttng.tc_gen5_mma {{.*}} meta {{.*}}
     %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf16, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<128x128xf32, #blocked>
     tt.return %0 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// On datacenter Blackwell the 8-bit sparse dot becomes an MMAv5
+// ttng.tc_gen5_mma with the metadata as an extra tensor-memory operand. The
+// 8-bit metadata layout is one metadata row per tensor-memory lane with two i16
+// packed per 32-bit cell along K, which is a plain packed
+// tensor_memory_encoding over the [M, K_dense/16] i16 tensor.
+
+// CHECK-DAG: #[[$TMEM_META:.+]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 4, colStride = 1>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm100_fp8
+  tt.func public @sparse_dot_sm100_fp8(%a: tensor<128x32xf8E4M3FN, #blocked>,
+                                       %b: tensor<64x128xf8E4M3FN, #blocked>,
+                                       %meta: tensor<128x4xi16, #blocked>) -> tensor<128x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // CHECK: ttng.tmem_alloc {{.*}} -> !ttg.memdesc<128x4xi16, #[[$TMEM_META]], #ttng.tensor_memory>
+    // CHECK: ttng.tc_gen5_mma {{.*}} meta {{.*}}
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x32xf8E4M3FN, #blocked> meta tensor<128x4xi16, #blocked> * tensor<64x128xf8E4M3FN, #blocked> -> tensor<128x128xf32, #blocked>
+    tt.return %0 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// tcgen05 takes M % 64 == 0 on 4 or 8 warps, mirroring the dense rules in
+// supportMMA, so an M = 32 dot is not SparseBlockedToMMAv5's. It still has to
+// land somewhere: mma.sp covers every M >= 16, and SparseBlockedToMMA takes it.
+// Getting this wrong leaves an unlowered tt.dot_sparse on #blocked and the
+// kernel fails to compile.
+//
+// On the way it widens the fp8 operands to f16, because ptxas emulates MMAv2's
+// fp8 instructions as an fp16 upcast plus an fp16 HMMA everywhere but sm_89 and
+// sm_12x -- so the instruction that comes out is m16n8k32.f16, with kWidth 2
+// rather than the 4 an 8-bit operand would get. The widening has to happen here
+// rather than in decomposeMixedModeDotOp, which runs after this pass: the
+// metadata layout is derived from the operand bitwidth, and the m16n8k64
+// mapping an 8-bit dot would get is not the one m16n8k32 reads.
+
+// CHECK-DAG: #[[$MMA_SMALL_M:.+]] = #ttg.nvidia_mma<{versionMajor = 2, {{.*}}}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm100_fp8_small_m
+  tt.func public @sparse_dot_sm100_fp8_small_m(%a: tensor<32x32xf8E4M3FN, #blocked>,
+                                               %b: tensor<64x128xf8E4M3FN, #blocked>,
+                                               %meta: tensor<32x4xi16, #blocked>) -> tensor<32x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x128xf32, #blocked>
+    // CHECK-NOT: ttng.tc_gen5_mma
+    // CHECK-DAG: tt.fp_to_fp %arg0 : tensor<32x32xf8E4M3FN, #blocked> -> tensor<32x32xf16, #blocked>
+    // CHECK-DAG: tt.fp_to_fp %arg1 : tensor<64x128xf8E4M3FN, #blocked> -> tensor<64x128xf16, #blocked>
+    // CHECK: tt.dot_sparse {{.*}}xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA_SMALL_M]], kWidth = 2}>>
+    // CHECK-SAME: -> tensor<32x128xf32, #[[$MMA_SMALL_M]]>
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<32x32xf8E4M3FN, #blocked> meta tensor<32x4xi16, #blocked> * tensor<64x128xf8E4M3FN, #blocked> -> tensor<32x128xf32, #blocked>
+    tt.return %0 : tensor<32x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// M = 64 is Layout F: the instruction drives only half the tensor-memory
+// datapath lanes, and blockM = 64 on the metadata encoding is that placement.
+// The spec's alignment restriction then requires A, D and the metadata to pick
+// the same half, which TensorMemoryAllocation enforces by joining the metadata
+// allocation to the accumulator's row group.
+
+// CHECK-DAG: #[[$TMEM_META_M64:.+]] = #ttng.tensor_memory_encoding<blockM = 64, blockN = 4, colStride = 1, sparseMetaRowPaired = true>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm100_f16_m64
+  tt.func public @sparse_dot_sm100_f16_m64(%a: tensor<64x32xf16, #blocked>,
+                                           %b: tensor<64x128xf16, #blocked>,
+                                           %meta: tensor<64x4xi16, #blocked>) -> tensor<64x128xf32, #blocked> {
+    %cst = arith.constant dense<0.000000e+00> : tensor<64x128xf32, #blocked>
+    // CHECK: ttng.tmem_alloc {{.*}} -> !ttg.memdesc<64x4xi16, #[[$TMEM_META_M64]], #ttng.tensor_memory>
+    // CHECK: ttng.tc_gen5_mma {{.*}} meta {{.*}}
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<64x32xf16, #blocked> meta tensor<64x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<64x128xf32, #blocked>
+    tt.return %0 : tensor<64x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// sm_103 has no int8 tcgen05 MMA -- ptxas rejects tcgen05.mma.kind::i8 for
+// sm_103a by name while assembling it for sm_100a and sm_110a -- so the int8
+// sparse dot goes back to MMAv2 there even at M = 128. That is the same
+// fallback the fp8 case above needs for a different reason, which is why both
+// have to be decided in one place.
+
+// CHECK-DAG: #[[$MMA_SM103:.+]] = #ttg.nvidia_mma<{versionMajor = 2, {{.*}}}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:103", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm103_i8
+  tt.func public @sparse_dot_sm103_i8(%a: tensor<128x64xi8, #blocked>,
+                                      %b: tensor<128x128xi8, #blocked>,
+                                      %meta: tensor<128x8xi16, #blocked>) -> tensor<128x128xi32, #blocked> {
+    %cst = arith.constant dense<0> : tensor<128x128xi32, #blocked>
+    // CHECK-NOT: ttng.tc_gen5_mma
+    // CHECK: tt.dot_sparse {{.*}} -> tensor<128x128xi32, #[[$MMA_SM103]]>
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x64xi8, #blocked> meta tensor<128x8xi16, #blocked> * tensor<128x128xi8, #blocked> -> tensor<128x128xi32, #blocked>
+    tt.return %0 : tensor<128x128xi32, #blocked>
+  }
+}
+
+// -----
+
+// Thor's sm_110 does have it, so the same dot reaches tcgen05.mma.sp there.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.target" = "cuda:110", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: sparse_dot_sm110_i8
+  tt.func public @sparse_dot_sm110_i8(%a: tensor<128x64xi8, #blocked>,
+                                      %b: tensor<128x128xi8, #blocked>,
+                                      %meta: tensor<128x8xi16, #blocked>) -> tensor<128x128xi32, #blocked> {
+    %cst = arith.constant dense<0> : tensor<128x128xi32, #blocked>
+    // CHECK: ttng.tc_gen5_mma {{.*}} meta {{.*}}
+    %0 = tt.dot_sparse %a, %b, %cst, %meta : tensor<128x64xi8, #blocked> meta tensor<128x8xi16, #blocked> * tensor<128x128xi8, #blocked> -> tensor<128x128xi32, #blocked>
+    tt.return %0 : tensor<128x128xi32, #blocked>
   }
 }
 

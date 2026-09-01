@@ -1,3 +1,5 @@
+import contextlib
+
 import pytest
 import re
 from types import SimpleNamespace
@@ -419,13 +421,13 @@ def test_fp8_compiles_for_multiple_architectures_cuda():
 
 @triton.jit
 def _sparse_matmul_kernel(a_ptr, b_ptr, c_ptr, meta_ptr, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                          BLOCK_K: tl.constexpr):
+                          BLOCK_K: tl.constexpr, ACC_DTYPE: tl.constexpr):
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     a_ptrs = a_ptr + offs_m[:, None] * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)[None, :]
     b_ptrs = b_ptr + tl.arange(0, BLOCK_K)[:, None] * BLOCK_N + offs_n[None, :]
     m_ptrs = meta_ptr + offs_m[:, None] * (BLOCK_K // 16) + tl.arange(0, BLOCK_K // 16)[None, :]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
     for _ in range(0, K, BLOCK_K):
         acc = tl.dot_sparse(tl.load(a_ptrs), tl.load(b_ptrs), tl.load(m_ptrs), acc)
         a_ptrs += BLOCK_K // 2
@@ -434,37 +436,217 @@ def _sparse_matmul_kernel(a_ptr, b_ptr, c_ptr, meta_ptr, K, BLOCK_M: tl.constexp
     tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], acc)
 
 
-def _compile_sparse_matmul(capability, dtype, block_k):
+@contextlib.contextmanager
+def _hopper_sparse_enabled():
+    """Turn on the Hopper sparse path for the duration of a test.
+
+    It ships off because its numerics have never run on a Hopper device; the
+    tests still need to pin what it generates.
+    """
+    from triton import knobs
+    with knobs.nvidia.scope():
+        knobs.nvidia.enable_unverified_sparse_wgmma = True
+        yield
+
+
+def _compile_sparse_matmul_m(capability, dtype, block_k, num_warps=4, block_m=128):
+    is_int = dtype == "*i8"
     src = ASTSource(
         fn=_sparse_matmul_kernel, signature={
-            "a_ptr": dtype, "b_ptr": dtype, "c_ptr": "*fp32", "meta_ptr": "*i16", "K": "i32",
-            "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"
-        }, constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": block_k})
-    return triton.compile(src, target=GPUTarget("cuda", capability, 32), options={"num_warps": 4})
+            "a_ptr": dtype, "b_ptr": dtype, "c_ptr": "*i32" if is_int else "*fp32", "meta_ptr": "*i16", "K": "i32",
+            "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr", "ACC_DTYPE": "constexpr"
+        }, constexprs={
+            "BLOCK_M": block_m, "BLOCK_N": 128, "BLOCK_K": block_k,
+            "ACC_DTYPE": tl.int32 if is_int else tl.float32
+        })
+    return triton.compile(src, target=GPUTarget("cuda", capability, 32), options={"num_warps": num_warps})
+
+
+def _compile_sparse_matmul(capability, dtype, block_k, num_warps=4):
+    return _compile_sparse_matmul_m(capability, dtype, block_k, num_warps)
 
 
 @pytest.mark.parametrize("capability", [80, 86, 120])
 def test_compile_only_dot_sparse_mmav2(capability) -> None:
-    """sm_80-sm_89 and consumer Blackwell both use mma.sp.sync (MMAv2)."""
+    """sm_80-sm_89 and consumer Blackwell both use mma.sp (MMAv2).
+
+    Blackwell takes the `sp::ordered_metadata` spelling, which the legacy form is
+    4-6x slower than there for fp16 and int8; sm_80-sm_89 keep the legacy one so
+    their PTX floor is not raised for no measured gain.
+    """
     ptx = _compile_sparse_matmul(capability, "*fp16", 64).asm["ptx"]
-    assert "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32" in ptx
+    sp = "sp::ordered_metadata" if capability >= 100 else "sp"
+    assert f"mma.{sp}.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32" in ptx
+    # ...and definitely not the other spelling.
+    other = "sp" if capability >= 100 else "sp::ordered_metadata"
+    assert f"mma.{other}.sync.aligned.m16n8k32" not in ptx
     assert "wgmma" not in ptx
 
 
 def test_compile_only_dot_sparse_mmav3() -> None:
     """Hopper uses wgmma.mma_async.sp, whose K is the dense K."""
-    ptx = _compile_sparse_matmul(90, "*fp16", 64).asm["ptx"]
+    with _hopper_sparse_enabled():
+        ptx = _compile_sparse_matmul(90, "*fp16", 64).asm["ptx"]
     assert re.search(r"wgmma\.mma_async\.sp\.sync\.aligned\.m64n\d+k32\.f32\.f16\.f16", ptx)
     assert "mma.sp.sync" not in ptx
 
 
 def test_compile_only_dot_sparse_mmav3_8bit() -> None:
     """The 8-bit Hopper shape is m64nNk64 for both fp8 and int8."""
-    ptx = _compile_sparse_matmul(90, "*fp8e4nv", 128).asm["ptx"]
+    with _hopper_sparse_enabled():
+        ptx = _compile_sparse_matmul(90, "*fp8e4nv", 128).asm["ptx"]
     assert re.search(r"wgmma\.mma_async\.sp\.sync\.aligned\.m64n\d+k64\.f32\.e4m3\.e4m3", ptx)
 
 
-def test_compile_only_dot_sparse_unsupported_target() -> None:
-    """Datacenter Blackwell has tcgen05.mma.sp, which is not implemented yet."""
-    with pytest.raises(triton.CompilationError, match="Unsupported lhs dtype fp16 for dot_sparse on this target"):
-        _compile_sparse_matmul(100, "*fp16", 64)
+@pytest.mark.parametrize("dtype", ["*i8", "*fp8e4nv"])
+def test_compile_only_dot_sparse_mmav5(dtype) -> None:
+    """Datacenter Blackwell uses tcgen05.mma.sp with the metadata in TMEM."""
+    k = _compile_sparse_matmul(100, dtype, 128)
+    kind = "i8" if dtype == "*i8" else "f8f6f4"
+    assert f"tcgen05.mma.sp.cta_group::1.kind::{kind}" in k.asm["ptx"]
+    # The metadata is one i16 row per TMEM lane, two per 32-bit cell along K.
+    assert "#ttng.tensor_memory_encoding<blockM = 128, blockN = 8, colStride = 1>" in k.asm["ttgir"]
+
+
+@pytest.mark.parametrize("capability", [103])
+def test_compile_only_dot_sparse_int8_no_tcgen05(capability) -> None:
+    """int8 has no tcgen05 MMA on sm_103.
+
+    ptxas is precise about which parts have it: it assembles
+    tcgen05.mma.kind::i8 for sm_100a and sm_110a and rejects it for sm_103a with
+    "Feature '.kind::i8' not supported". So sm_103 goes back to MMAv2, and the
+    sparse path has to agree or it would emit an instruction the chip cannot
+    run. fp8 keeps tcgen05 there.
+    """
+    int8 = _compile_sparse_matmul(capability, "*i8", 128).asm["ptx"]
+    assert "mma.sp::ordered_metadata.sync.aligned.m16n8k64" in int8
+    assert "tcgen05.mma" not in int8
+
+    fp8 = _compile_sparse_matmul(capability, "*fp8e4nv", 128).asm["ptx"]
+    assert "tcgen05.mma.sp.cta_group::1.kind::f8f6f4" in fp8
+
+
+@pytest.mark.parametrize("capability", [100, 103, 110])
+@pytest.mark.parametrize("dtype", ["*i8", "*fp8e4nv"])
+def test_compile_only_dot_sparse_small_m_falls_back_to_mma_sp(capability, dtype) -> None:
+    """M is not a bound on datacenter Blackwell, it is a routing fork.
+
+    tcgen05 takes M % 64 == 0 on 4 or 8 warps, mirroring the dense rules in
+    supportMMA. Anything else -- M = 32 here -- is declined by
+    SparseBlockedToMMAv5, and mma.sp takes every M >= 16, so the dot lowers
+    there instead of being rejected. That is the same fallback Hopper takes for
+    shapes wgmma.mma_async.sp cannot express.
+
+    int8 keeps its own 8-bit shape; fp8 is promoted to f16 first, which is what
+    the next test is about.
+    """
+    ptx = _compile_sparse_matmul_m(capability, dtype, 128, block_m=32).asm["ptx"]
+    shape = "m16n8k64" if dtype == "*i8" else "m16n8k32"
+    assert f"mma.sp::ordered_metadata.sync.aligned.{shape}" in ptx
+    assert "tcgen05.mma" not in ptx
+
+
+@pytest.mark.parametrize("capability", [100, 110])
+@pytest.mark.parametrize("dtype", ["*fp16", "*fp8e4nv"])
+def test_compile_only_dot_sparse_mmav5_m64(capability, dtype) -> None:
+    """M = 64 is Layout F -- half the tensor-memory datapath lanes -- and
+    blockM = 64 on the metadata encoding describes exactly that placement.
+
+    The spec's alignment restriction then requires A, D and the metadata to sit
+    in the same half, which TensorMemoryAllocation enforces by joining the
+    metadata allocation to the accumulator's row group. Without that join the
+    metadata lands in the other half and the instruction faults at run time.
+    """
+    k = _compile_sparse_matmul_m(capability, dtype, 128, block_m=64)
+    kind = "f16" if dtype == "*fp16" else "f8f6f4"
+    assert f"tcgen05.mma.sp.cta_group::1.kind::{kind}" in k.asm["ptx"]
+    assert "blockM = 64" in k.asm["ttgir"]
+
+
+@pytest.mark.parametrize("capability", [100, 103, 110])
+def test_compile_only_dot_sparse_fp8_promoted_off_tcgen05(capability) -> None:
+    """A sparse fp8 dot that lands on MMAv2 is promoted to f16 first.
+
+    Outside sm_89 and sm_12x, ptxas emulates the MMAv2 fp8 instructions as an
+    fp16 upcast plus an fp16 HMMA -- measured at 4.7 TF/s against 41.9 for the
+    f16 spelling on sm_110. decomposeMixedModeDotOp already promotes the dense
+    dot for this reason; promoteFp8SparseDotOperands does the same for the
+    sparse one. f16 holds every e4m3 and e5m2 value exactly, so it is lossless.
+    """
+    ptx = _compile_sparse_matmul_m(capability, "*fp8e4nv", 128, block_m=32).asm["ptx"]
+    assert "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32" in ptx
+    assert "e4m3" not in ptx.split("mma.sp")[1][:200]
+
+
+@pytest.mark.parametrize("capability", [89, 120])
+def test_compile_only_dot_sparse_fp8_native_stays_native(capability) -> None:
+    """...and the parts with real MMAv2 fp8 hardware keep the 8-bit instruction.
+
+    Promoting there would halve the instruction's K for nothing.
+    """
+    ptx = _compile_sparse_matmul_m(capability, "*fp8e4nv", 128, block_m=64).asm["ptx"]
+    assert "m16n8k64.row.col.f32.e4m3.e4m3.f32" in ptx
+
+
+def test_compile_only_dot_sparse_fp8_promotion_skips_wide_instructions() -> None:
+    """Promotion must not fire where fp8 reaches a wider sparse MMA natively.
+
+    tcgen05.mma.sp (M % 64 == 0 on datacenter Blackwell) and wgmma.mma_async.sp
+    (Hopper) both take fp8 operands, so widening to f16 there would throw the
+    wider instruction away.
+    """
+    assert "tcgen05.mma.sp.cta_group::1.kind::f8f6f4" in \
+        _compile_sparse_matmul_m(110, "*fp8e4nv", 128, block_m=128).asm["ptx"]
+    with _hopper_sparse_enabled():
+        assert "wgmma.mma_async.sp.sync.aligned.m64n128k64.f32.e4m3.e4m3" in \
+            _compile_sparse_matmul_m(90, "*fp8e4nv", 128, block_m=64).asm["ptx"]
+
+
+def test_compile_only_dot_sparse_min_m_is_the_instruction_shape() -> None:
+    """m16n8 is the only M bound, and it is the same on every target.
+
+    A 64-row tile compiles everywhere, and 8 rows is rejected everywhere -- what
+    changes across targets is which instruction it lands on, not whether it is
+    allowed.
+    """
+    for capability in (86, 100, 110, 120):
+        _compile_sparse_matmul_m(capability, "*i8", 128, block_m=64)
+    with _hopper_sparse_enabled():
+        _compile_sparse_matmul_m(90, "*i8", 128, block_m=64)
+    with pytest.raises(triton.CompilationError, match=r"M >= 16"):
+        _compile_sparse_matmul_m(100, "*i8", 128, block_m=8)
+
+
+def test_compile_only_dot_sparse_hopper_off_by_default() -> None:
+    """The Hopper path ships disabled until its numerics run on a Hopper device."""
+    with pytest.raises(triton.CompilationError, match="Unsupported lhs dtype fp16 for dot_sparse"):
+        _compile_sparse_matmul(90, "*fp16", 64)
+    with _hopper_sparse_enabled():
+        assert "wgmma.mma_async.sp" in _compile_sparse_matmul(90, "*fp16", 64).asm["ptx"]
+
+
+@pytest.mark.parametrize("dtype", ["*fp16", "*bf16"])
+def test_compile_only_dot_sparse_mmav5_16bit(dtype) -> None:
+    """fp16/bf16 reach tcgen05.mma.sp through .kind::f16.
+
+    Their metadata layout is not the 8-bit one: a 32-bit tensor-memory cell
+    holds rows m and m + 8 of one metadata column rather than two columns of one
+    row, which sparseMetaRowPaired on the encoding selects.
+    """
+    k = _compile_sparse_matmul(100, dtype, 128)
+    assert "tcgen05.mma.sp.cta_group::1.kind::f16" in k.asm["ptx"]
+    assert ("#ttng.tensor_memory_encoding<blockM = 128, blockN = 8, colStride = 1, "
+            "sparseMetaRowPaired = true>") in k.asm["ttgir"]
+
+
+def test_compile_only_dot_sparse_16bit_shares_a_metadata_granule() -> None:
+    """.kind::f16 metadata is half of the 64-bit granule the instruction
+    addresses, so consecutive instructions keep the same address and move the
+    sparsity selector instead. Addressing the odd column directly assembles but
+    faults with a misaligned address on hardware."""
+    ptx = _compile_sparse_matmul(100, "*fp16", 128).asm["ptx"]
+    metas = re.findall(r"tcgen05\.mma\.sp\.cta_group::1\.kind::f16 \[ %r\d+ \+ \d+ \], "
+                       r"%rd\d+, %rd\d+, \[ %r\d+ \+ (\d+) \]", ptx)
+    assert metas, "no tcgen05.mma.sp emitted"
+    # Every metadata offset is even: the odd half is reached by the selector.
+    assert all(int(off) % 2 == 0 for off in metas), metas

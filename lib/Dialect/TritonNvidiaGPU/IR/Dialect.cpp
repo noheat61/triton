@@ -185,6 +185,54 @@ LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
 
 static std::optional<LinearLayout>
 getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
+                                unsigned numWarps, int bitwidth);
+
+// A 32-bit tensor-memory cell always holds the two values at column 2c and
+// 2c + 1. Which *logical* elements those are is the layout's business: every
+// dense layout puts two adjacent columns of one row there, which the caller
+// factors out as an identity prefix. The sparsity metadata the 16-bit
+// tcgen05.mma.sp kinds read instead pairs rows m and m + 8 of one column.
+//
+// Peel that first column basis into a register basis whatever it maps to. This
+// cannot go through the identity-prefix path even in general form: there the
+// quotient is recombined with a tensor product, which rescales the output
+// dimension the pair basis lands on, and here it lands on a row.
+//
+// The lowering needs no matching change, because it reasons in physical
+// row/column space, where the pair is two adjacent columns either way.
+static std::optional<LinearLayout>
+getPackedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
+                           unsigned numWarps, int bitwidth) {
+  if (bitwidth != 16)
+    return std::nullopt;
+  auto rowColDims = to_vector(ll.getInDimNames());
+  if (ll.getInDimSize(rowColDims[1]) < 2)
+    return std::nullopt;
+  auto pairBasisRef = ll.getBasis(rowColDims[1], 0);
+  std::vector<int32_t> pairBasis(pairBasisRef.begin(), pairBasisRef.end());
+  // A zero basis is broadcasting, which the unpacked and padded paths own.
+  if (llvm::all_of(pairBasis, [](int32_t v) { return v == 0; }))
+    return std::nullopt;
+
+  auto bases32 = ll.getBases();
+  auto &colBases = bases32[rowColDims[1]];
+  colBases.erase(colBases.begin());
+  LinearLayout ll32(std::move(bases32), to_vector(ll.getOutDims()),
+                    /*requireSurjective=*/false);
+
+  auto ret = getDistributedLayoutForTmemLdSt(ll32, atom, numWarps, 32);
+  if (!ret)
+    return std::nullopt;
+  auto *ctx = rowColDims[0].getContext();
+  auto bases = ret->getBases();
+  bases[StringAttr::get(ctx, "register")].insert(
+      bases[StringAttr::get(ctx, "register")].begin(), pairBasis);
+  return LinearLayout(std::move(bases), to_vector(ret->getOutDims()),
+                      /*requireSurjective=*/false);
+}
+
+static std::optional<LinearLayout>
+getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
                                 unsigned numWarps, int bitwidth) {
   auto dims = to_vector(ll.getOutDimNames());
   assert(dims.size() == 2);
@@ -226,6 +274,11 @@ getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
     } else if (ll.getInDimSize(rowColDims[1]) == 1) {
       // Software padding with just one column
       return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, 32);
+    } else if (auto packed = getPackedLayoutForTmemLdSt(ll, atom, numWarps,
+                                                        bitwidth)) {
+      // The pair sharing a 32-bit cell is not two adjacent columns, but the
+      // cell is still a pair. See getPackedLayoutForTmemLdSt.
+      return packed;
     } else {
       // This can fail for fp4_padded layouts as we don't support implicit
       // padding and unpadding upon load yet.
@@ -432,7 +485,7 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
 LogicalResult TensorMemoryEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
     unsigned blockN, unsigned colStride, gpu::CGAEncodingAttr cgaLayout,
-    bool twoCTAs, bool fp4Padded) {
+    bool twoCTAs, bool fp4Padded, bool sparseMetaRowPaired) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
   }
@@ -463,6 +516,27 @@ LogicalResult TensorMemoryEncodingAttr::verify(
     return emitError() << "fp4Padded tensor memory layout requires colStride "
                           "1 but got "
                        << colStride;
+  }
+  if (sparseMetaRowPaired) {
+    // The exchange the layout performs is between row bit 3 and column bit 0,
+    // so both bits have to exist and the columns have to be packed.
+    if (blockM != 64 && blockM != 128) {
+      return emitError()
+             << "sparseMetaRowPaired requires blockM 64 or 128 but got "
+             << blockM;
+    }
+    if (colStride != 1) {
+      return emitError()
+             << "sparseMetaRowPaired requires colStride 1 but got " << colStride;
+    }
+    if (blockN < 2) {
+      return emitError()
+             << "sparseMetaRowPaired requires blockN >= 2 but got " << blockN;
+    }
+    if (fp4Padded) {
+      return emitError() << "sparseMetaRowPaired is not compatible with "
+                            "fp4Padded";
+    }
   }
   return success();
 }

@@ -705,7 +705,7 @@ def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait", [MemWaitOpTrait]> {
 
 def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-    DeclareOpInterfaceMethods<DotOpInterface>,
+    DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims"]>,
     DeclareOpInterfaceMethods<MMAv5OpInterface>,
     DeclareOpInterfaceMethods<PredicatedOpInterface>,
     DeclareOpInterfaceMethods<MBarrierOpInterface>,
@@ -728,6 +728,12 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
 
     The `isUnsigned` attribute is only relevant when performing an integer MMA operation.
     If true, the integer values are treated as unsigned, otherwise they are treated as signed.
+
+    When the optional $a_meta operand is present, $a is 2:4 structured sparse and
+    this lowers to `tcgen05.mma.sp` instead of `tcgen05.mma`. $a then holds only
+    the kept elements, so its K dimension is half of the logical (dense) K, which
+    is the K dimension of $b. $a_meta is the i16 sparsity metadata matrix
+    resident in tensor memory; see `tt.dot_sparse` for the element format.
   }];
 
   let arguments = (ins
@@ -737,6 +743,7 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     Optional<TTG_AsyncToken>:$acc_dep,
     I1:$useD,
     I1:$pred,
+    Optional<TTG_MemDescType>:$a_meta,
     Variadic<TTG_MemDescType>:$barriers,
     Variadic<I1>:$barrier_preds,
     UnitAttr:$is_async,
@@ -754,14 +761,20 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
       CArg<"ValueRange", "{}">:$barriers,
       CArg<"ValueRange", "{}">:$barrier_preds,
       CArg<"bool", "false">:$is_async,
-      CArg<"bool", "false">:$is_unsigned)>
+      CArg<"bool", "false">:$is_unsigned,
+      CArg<"Value", "{}">:$a_meta)>
   ];
 
   let assemblyFormat = [{
-    $a `,` $b `,` $d `` custom<Token>($acc_dep, type($token)) `,` $useD`,`
+    $a (`meta` $a_meta^)? `,` $b `,` $d `` custom<Token>($acc_dep, type($token)) `,` $useD`,`
     $pred `` custom<BarriersAndPreds>($barriers, $barrier_preds)
-    attr-dict `:` qualified(type($a)) `,` qualified(type($b)) `,`
+    attr-dict `:` qualified(type($a)) (`meta` qualified(type($a_meta))^)? `,`
+    qualified(type($b)) `,`
     qualified(type($d)) (`,` qualified(type($barriers))^)?
+  }];
+
+  let extraClassDeclaration = [{
+    bool isSparse() { return getAMeta() != nullptr; }
   }];
 
   let hasVerifier = 1;

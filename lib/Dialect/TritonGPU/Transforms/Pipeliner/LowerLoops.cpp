@@ -793,6 +793,15 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
     waitBuffers.push_back(mmaAsScaledDotOp.getAScale());
     waitBuffers.push_back(mmaAsScaledDotOp.getBScale());
   }
+  // tcgen05.mma.sp reads its sparsity metadata out of tensor memory for as long
+  // as the MMA is in flight, exactly like A and B, so the next iteration's
+  // store into that buffer has to wait on the same barrier. Without this the
+  // metadata is the one MMA operand a pipelined loop is free to overwrite
+  // early.
+  if (auto mmaAsDot = dyn_cast<ttng::TCGen5MMAOp>(mma.getOperation())) {
+    if (Value aMeta = mmaAsDot.getAMeta())
+      waitBuffers.push_back(aMeta);
+  }
 
   builder.setInsertionPointAfter(mma);
   builder.setStageCluster({mainWaitStage, mainWaitCluster});

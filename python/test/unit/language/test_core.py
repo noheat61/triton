@@ -7688,6 +7688,16 @@ sparse_dot_shapes = [
     (32, 32, 128, 32, 32, 128, 1),  # several K groups within one dot
     (64, 64, 128, 64, 64, 64, 2),  # multiple warps
     (128, 128, 128, 64, 64, 64, 4),
+    # BLOCK_M 128 is what tcgen05.mma.sp's metadata layout needs, so on
+    # datacenter Blackwell this is the shape that reaches it; below it the dot
+    # falls back to mma.sp. BLOCK_K 64 gives .kind::f16 two instructions per K
+    # step, which is what moves the sparsity selector across a metadata granule.
+    (128, 128, 128, 128, 128, 64, 4),
+    # M = 64 on 4 warps is tcgen05's Layout F, which drives half the
+    # tensor-memory datapath lanes and needs A, D and the metadata in the same
+    # half. M = 32 above it stays on mma.sp, so both sides of that fork are
+    # covered.
+    (64, 128, 128, 64, 128, 64, 4),
 ]
 
 
@@ -7704,8 +7714,9 @@ def test_dot_sparse(in_dtype, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_warps, dev
         pytest.skip("NVIDIA backend only")
     capability = torch.cuda.get_device_capability()
     cc = capability[0] * 10 + capability[1]
-    if not (80 <= cc < 100 or 120 <= cc < 130):
-        pytest.skip("sparse dot uses mma.sp on sm_80-sm_89 and sm_120+, wgmma.mma_async.sp on sm_90")
+    if not (80 <= cc < 130):
+        pytest.skip("sparse dot is an sm_80+ path: mma.sp on sm_80-sm_89 and sm_120+, "
+                    "wgmma.mma_async.sp on sm_90, tcgen05.mma.sp on datacenter Blackwell")
     if in_dtype.startswith("float8") and cc < 89:
         pytest.skip("the fp8 flavours of mma.sp.m16n8k64 need sm_89")
 
@@ -7764,8 +7775,9 @@ def test_dot_sparse_fp16_accumulator(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_war
         pytest.skip("NVIDIA backend only")
     capability = torch.cuda.get_device_capability()
     cc = capability[0] * 10 + capability[1]
-    if not (80 <= cc < 100 or 120 <= cc < 130):
-        pytest.skip("sparse dot uses mma.sp on sm_80-sm_89 and sm_120+, wgmma.mma_async.sp on sm_90")
+    if not (80 <= cc < 130):
+        pytest.skip("sparse dot is an sm_80+ path: mma.sp on sm_80-sm_89 and sm_120+, "
+                    "wgmma.mma_async.sp on sm_90, tcgen05.mma.sp on datacenter Blackwell")
 
     values = [-2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0]
     a_dense, b_dense = _make_24_operands(M, N, K, values, device)

@@ -27,4 +27,25 @@ module attributes {"ttg.target" = "cuda:120", "ttg.num-ctas" = 1 : i32, "ttg.num
     tt.store %out_ptrs, %d, %zero : tensor<128x128x!tt.ptr<f32>, #blocked>
     tt.return
   }
+
+  // Blackwell takes the `sp::ordered_metadata` form of the sparse MMA. ptxas
+  // warns that the legacy `.sp` "is expected to have substantially reduced
+  // performance on some future architectures", and the ordered form silences it.
+  // The encoding does not change: the metadata this op's users build fills each
+  // group's two 2-bit indices in increasing order, which is exactly what the
+  // ordered form promises. sm_80-sm_89 keep `.sp` (see tritongpu_to_llvm.mlir)
+  // so their PTX floor stays put -- the ordered form needs PTX 8.5, 8.7 here.
+  // CHECK-LABEL: @sm120_dot_sparse_ordered_metadata
+  tt.func public @sm120_dot_sparse_ordered_metadata(
+      %a: tensor<128x32xf16, #blocked_k>, %b: tensor<64x128xf16, #blocked>,
+      %meta: tensor<128x4xi16, #blocked>, %out: !tt.ptr<f32>) {
+    %c = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // CHECK: mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32
+    %d = tt.dot_sparse %a, %b, %c, %meta : tensor<128x32xf16, #blocked_k> meta tensor<128x4xi16, #blocked> * tensor<64x128xf16, #blocked> -> tensor<128x128xf32, #blocked>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<128x1x!tt.ptr<f32>, #blocked>
+    %out_ptrs = tt.broadcast %out_splat : tensor<128x1x!tt.ptr<f32>, #blocked> -> tensor<128x128x!tt.ptr<f32>, #blocked>
+    %zero = arith.constant dense<0> : tensor<128x128xi1, #blocked>
+    tt.store %out_ptrs, %d, %zero : tensor<128x128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
 }
